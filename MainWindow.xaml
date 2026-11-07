@@ -10,7 +10,7 @@
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
-        <TextBlock Text="请每行输入一个软件（支持 winget ID 或名称）：" FontSize="14" Margin="0,0,0,10"/>
+        <TextBlock Text="请每行输入一个软件（名称 / 包 ID / 安装包直链）：" FontSize="14" Margin="0,0,0,10"/>
         
         <TextBox x:Name="InputTextBox" Grid.Row="1" AcceptsReturn="True" 
                  VerticalScrollBarVisibility="Auto" FontFamily="Consolas" FontSize="14" 
