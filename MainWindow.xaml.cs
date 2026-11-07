@@ -4,8 +4,10 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Security.Principal;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows;
@@ -14,7 +16,7 @@ namespace SoftwareAssistant
 {
     public partial class MainWindow : Window
     {
-        // 中文常用名 -> 英文检索词，用于跨语言模糊匹配
+        // 中文常用名 -> 英文检索词
         private static readonly Dictionary<string, string[]> Knowledge = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
         {
             { "微信",     new[] { "WeChat" } },
@@ -40,12 +42,13 @@ namespace SoftwareAssistant
             { "谷歌浏览器", new[] { "Google Chrome" } },
             { "chrome",   new[] { "Google Chrome" } },
             { "vscode",   new[] { "Visual Studio Code" } },
-            { "python",   new[] { "Python" } },
             { "steam",    new[] { "Steam" } },
             { "网易云",   new[] { "NetEase Cloud Music" } },
             { "剪映",     new[] { "JianYing", "CapCut" } },
             { "阿里云盘", new[] { "Aliyun Drive", "AliPan" } }
         };
+
+        private LlmConfig _llm;
 
         public MainWindow()
         {
@@ -54,7 +57,133 @@ namespace SoftwareAssistant
             {
                 MessageBox.Show("请右键点击软件，选择【以管理员身份运行】，否则无法安装软件！", "需要管理员权限", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
+            _llm = LoadConfig();
         }
+
+        // ---------------- 可选的大模型辅助（默认智谱 GLM-4-Flash） ----------------
+
+        private sealed class LlmConfig
+        {
+            public string ApiKey { get; set; }
+            public string BaseUrl { get; set; }
+            public string Model { get; set; }
+        }
+
+        private static string ConfigPath
+        {
+            get
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SoftwareAssistant");
+                return Path.Combine(dir, "config.json");
+            }
+        }
+
+        private static LlmConfig LoadConfig()
+        {
+            try
+            {
+                if (!File.Exists(ConfigPath)) return null;
+                string json = File.ReadAllText(ConfigPath, Encoding.UTF8);
+                var cfg = JsonSerializer.Deserialize<LlmConfig>(json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                if (cfg == null || string.IsNullOrWhiteSpace(cfg.ApiKey)) return null;
+                if (string.IsNullOrWhiteSpace(cfg.BaseUrl)) cfg.BaseUrl = "https://open.bigmodel.cn/api/paas/v4";
+                if (string.IsNullOrWhiteSpace(cfg.Model)) cfg.Model = "glm-4-flash";
+                return cfg;
+            }
+            catch { return null; }
+        }
+
+        private static string AskLlm(LlmConfig cfg, string systemPrompt, string userPrompt)
+        {
+            using (var http = new HttpClient())
+            {
+                http.Timeout = TimeSpan.FromSeconds(25);
+
+                var payload = new
+                {
+                    model = cfg.Model,
+                    temperature = 0,
+                    messages = new object[]
+                    {
+                        new { role = "system", content = systemPrompt },
+                        new { role = "user", content = userPrompt }
+                    }
+                };
+
+                var req = new HttpRequestMessage(HttpMethod.Post, cfg.BaseUrl.TrimEnd('/') + "/chat/completions");
+                req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + cfg.ApiKey);
+                req.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+
+                var resp = http.Send(req);
+                string text = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+
+                if (!resp.IsSuccessStatusCode)
+                    throw new Exception("HTTP " + (int)resp.StatusCode + ": " + (text.Length > 160 ? text.Substring(0, 160) : text));
+
+                using (var doc = JsonDocument.Parse(text))
+                {
+                    return doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
+                }
+            }
+        }
+
+        // 只在真实候选里挑，避免模型编造包名
+        private int AskBestIndex(string term, List<Candidate> cands)
+        {
+            if (_llm == null || cands.Count < 2) return -1;
+
+            try
+            {
+                int limit = Math.Min(cands.Count, 20);
+                var sb = new StringBuilder();
+                sb.AppendLine("用户想安装：" + term);
+                sb.AppendLine("候选列表：");
+                for (int i = 0; i < limit; i++)
+                    sb.AppendLine(string.Format("{0}. {1} ({2})", i + 1, cands[i].Name, cands[i].Id));
+                sb.AppendLine("规则：只能从上面选。只输出一个数字——最匹配候选的序号（从 1 开始）；如果都不匹配，输出 0。不要输出任何解释。");
+
+                string ans = AskLlm(_llm, "你是软件包匹配助手，负责从候选清单中挑出用户最可能想安装的那个软件。", sb.ToString());
+                var m = Regex.Match(ans ?? "", @"\d+");
+                if (!m.Success) return -1;
+
+                int n = int.Parse(m.Value);
+                if (n <= 0 || n > limit) return -1;
+                return n - 1;
+            }
+            catch (Exception ex)
+            {
+                AppendLog("    大模型调用失败，回退本地匹配: " + ex.Message);
+                return -1;
+            }
+        }
+
+        // 搜不到时，让模型给替代关键词
+        private List<string> AskQueries(string term)
+        {
+            var result = new List<string>();
+            if (_llm == null) return result;
+
+            try
+            {
+                string ans = AskLlm(_llm,
+                    "用户要安装某个 Windows 软件，请给出 3 个最可能的英文检索关键词。每行一个，不要编号，不要解释。",
+                    "用户输入：" + term);
+
+                foreach (var line in (ans ?? "").Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string t = Regex.Replace(line, @"^\s*(\d+[\.\)、]|[-*])\s*", "").Trim();
+                    if (t.Length >= 2 && t.Length <= 40) result.Add(t);
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog("    大模型调用失败: " + ex.Message);
+            }
+
+            return result.Distinct(StringComparer.OrdinalIgnoreCase).Take(3).ToList();
+        }
+
+        // ---------------- 主流程 ----------------
 
         private void StartButton_Click(object sender, RoutedEventArgs e)
         {
@@ -70,6 +199,9 @@ namespace SoftwareAssistant
 
             StartButton.IsEnabled = false;
             LogTextBox.Text = "开始执行...\r\n";
+            AppendLog(_llm == null
+                ? "提示: 未配置大模型，使用本地模糊匹配。配置文件: " + ConfigPath
+                : "提示: 已启用大模型辅助（" + _llm.Model + "）");
             SetProgress(0, "准备中");
 
             Task.Run(() =>
@@ -130,17 +262,15 @@ namespace SoftwareAssistant
             }
 
             var queries = BuildQueries(term);
-            var all = new List<Candidate>();
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var all = SearchAll(queries);
 
-            foreach (var q in queries)
+            if (all.Count == 0 && _llm != null)
             {
-                AppendLog("    → 搜索关键词: " + q);
-                SetIndeterminate("搜索: " + q);
-                RunProcess("winget", "search \"" + q + "\" --accept-source-agreements", out string so);
-                foreach (var c in ParseWinget(so))
+                var extra = AskQueries(term);
+                if (extra.Count > 0)
                 {
-                    if (seen.Add(c.Id + "|" + c.Name)) all.Add(c);
+                    AppendLog("    winget 无结果，大模型建议检索词: " + string.Join(" / ", extra));
+                    all = SearchAll(extra);
                 }
             }
 
@@ -150,7 +280,6 @@ namespace SoftwareAssistant
                 return false;
             }
 
-            // 打分：原始输入权重最高，别名关键词作为补充
             foreach (var c in all)
             {
                 double s = Math.Max(Score(term, c.Name), Score(term, c.Id) * 0.6);
@@ -162,14 +291,24 @@ namespace SoftwareAssistant
                 c.MatchScore = s;
             }
 
-            var top = all.OrderByDescending(c => c.MatchScore).Take(5).ToList();
-            AppendLog(string.Format("    → 共 {0} 个候选，模糊匹配前 {1}：", all.Count, top.Count));
-            foreach (var c in top)
+            var ordered = all.OrderByDescending(c => c.MatchScore).Take(6).ToList();
+            AppendLog(string.Format("    → 共 {0} 个候选，前 {1}：", all.Count, ordered.Count));
+            foreach (var c in ordered)
                 AppendLog(string.Format("        {0:0.00}  {1}  ({2}){3}", c.MatchScore, c.Name, c.Id,
                     string.IsNullOrEmpty(c.Source) ? "" : "  [" + c.Source + "]"));
 
-            var pick = top[0];
-            AppendLog(string.Format("    → 选择: {0} ({1})  匹配度 {2:0.00}", pick.Name, pick.Id, pick.MatchScore));
+            Candidate pick;
+            int aiIdx = AskBestIndex(term, ordered);
+            if (aiIdx >= 0)
+            {
+                pick = ordered[aiIdx];
+                AppendLog(string.Format("    → 大模型判定为第 {0} 个: {1} ({2})", aiIdx + 1, pick.Name, pick.Id));
+            }
+            else
+            {
+                pick = ordered[0];
+                AppendLog(string.Format("    → 本地匹配选择: {0} ({1})  匹配度 {2:0.00}", pick.Name, pick.Id, pick.MatchScore));
+            }
 
             SetIndeterminate("安装 " + pick.Id);
             if (RunProcess("winget", "install --id \"" + pick.Id + "\" --exact --silent --accept-package-agreements --accept-source-agreements", out string installOut))
@@ -181,6 +320,25 @@ namespace SoftwareAssistant
             AppendLog("    winget 安装失败：");
             AppendLastLines(installOut, 6);
             return false;
+        }
+
+        private List<Candidate> SearchAll(List<string> queries)
+        {
+            var all = new List<Candidate>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var q in queries)
+            {
+                AppendLog("    → 搜索关键词: " + q);
+                SetIndeterminate("搜索: " + q);
+                RunProcess("winget", "search \"" + q + "\" --accept-source-agreements", out string so);
+
+                foreach (var c in ParseWinget(so))
+                {
+                    if (seen.Add(c.Id + "|" + c.Name)) all.Add(c);
+                }
+            }
+            return all;
         }
 
         private sealed class Candidate
@@ -197,7 +355,6 @@ namespace SoftwareAssistant
             string k = Normalize(term);
             if (k.Length == 0) return qs;
 
-            // 取「最长匹配」的别名，避免 "qq音乐" 被 "qq" 抢先命中
             string bestKey = null;
             int bestLen = 0;
 
@@ -218,7 +375,6 @@ namespace SoftwareAssistant
             }
 
             if (bestKey != null) qs.AddRange(Knowledge[bestKey]);
-
             return qs.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         }
 
@@ -431,13 +587,12 @@ namespace SoftwareAssistant
 
         private bool InstallFromUrl(string url)
         {
-            string target = "";
             try
             {
                 AppendLog("  → 下载安装包");
                 string fileName = Path.GetFileName(new Uri(url).AbsolutePath);
                 if (string.IsNullOrWhiteSpace(fileName)) fileName = "setup.exe";
-                target = Path.Combine(Path.GetTempPath(), fileName);
+                string target = Path.Combine(Path.GetTempPath(), fileName);
 
                 using (var wc = new WebClient())
                 {
