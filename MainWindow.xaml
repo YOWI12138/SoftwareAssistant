@@ -103,6 +103,8 @@
                         Style="{StaticResource PrimaryButton}" Click="PreviewButton_Click"/>
                 <Button x:Name="StartButton" Content="直接安装" Width="110" Margin="10,0,0,0"
                         Style="{StaticResource GhostButton}" Click="StartButton_Click"/>
+                <Button x:Name="StopButton" Content="停止" Width="80" Margin="10,0,0,0"
+                        Background="#7A2E2E" Style="{StaticResource GhostButton}" Click="StopButton_Click"/>
                 <Button x:Name="ClearButton" Content="清空日志" Width="100" Margin="10,0,0,0"
                         Style="{StaticResource GhostButton}" Click="ClearButton_Click"/>
             </StackPanel>

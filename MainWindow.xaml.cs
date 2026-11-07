@@ -1026,6 +1026,7 @@ namespace SoftwareAssistant
 
         private void RunPlan(List<PlanItem> plan)
         {
+            _stopRequested = false;
             StartButton.IsEnabled = false;
             PreviewButton.IsEnabled = false;
 
@@ -1036,6 +1037,8 @@ namespace SoftwareAssistant
                 int ok = 0, fail = 0;
                 for (int i = 0; i < plan.Count; i++)
                 {
+                    if (_stopRequested) { AppendLog("⏹ 已停止"); break; }
+
                     var p = plan[i];
                     SetProgress(i * 100.0 / plan.Count, string.Format("({0}/{1}) {2}", i + 1, plan.Count, p.Term));
                     AppendLog("\r\n========================================");
@@ -1084,6 +1087,7 @@ namespace SoftwareAssistant
             if (list.Count == 0) return;
 
             SuggestionPopup.IsOpen = false;
+            _stopRequested = false;
             StartButton.IsEnabled = false;
             PreviewButton.IsEnabled = false;
             LogTextBox.Text = "开始执行...\r\n";
@@ -1097,6 +1101,8 @@ namespace SoftwareAssistant
                 int ok = 0, fail = 0;
                 for (int i = 0; i < list.Count; i++)
                 {
+                    if (_stopRequested) { AppendLog("⏹ 已停止"); break; }
+
                     string term = list[i];
                     AppendLog("\r\n========================================");
                     AppendLog(string.Format("[{0}/{1}] 正在安装: {2}", i + 1, list.Count, term));
@@ -1655,6 +1661,14 @@ namespace SoftwareAssistant
             var identity = WindowsIdentity.GetCurrent();
             var principal = new WindowsPrincipal(identity);
             return principal.IsInRole(WindowsBuiltInRole.Administrator);
+        }
+
+        private volatile bool _stopRequested;
+
+        private void StopButton_Click(object sender, RoutedEventArgs e)
+        {
+            _stopRequested = true;
+            AppendLog("⏹ 已请求停止：当前这一项处理完就会中止");
         }
 
         private void ClearButton_Click(object sender, RoutedEventArgs e)
