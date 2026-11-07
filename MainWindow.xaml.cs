@@ -115,7 +115,8 @@ namespace SoftwareAssistant
             var list = new List<Candidate>();
             if (string.IsNullOrEmpty(output)) return list;
 
-            var rowRx = new Regex(@"^(?<name>.+?)\s+(?<id>[A-Za-z0-9][A-Za-z0-9_\-\.]*\.[A-Za-z0-9_\-\.]+)\s+(?<ver>\S+)\s+(?<src>winget|msstore)\s*$");
+            // 兜底用的正则：兼容 2 列 / 3 列 / 4 列三种表头
+            var rowRx = new Regex(@"^(?<name>.+?)\s+(?<id>[A-Za-z0-9][A-Za-z0-9_\-\.]*\.[A-Za-z0-9_\-\.]+)(\s+(?<ver>\S+))?(\s+(?<src>winget|msstore))?\s*$");
 
             foreach (var rawLine in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
             {
@@ -124,19 +125,40 @@ namespace SoftwareAssistant
 
                 string t = line.Trim();
                 if (t.StartsWith("-")) continue;
+                if (t.Length < 3) continue;
                 if (t.StartsWith("Name") || t.StartsWith("名称")) continue;
 
+                // 优先按「2 个以上空格」切列：Name | Id | Version [| Source]
+                var parts = Regex.Split(t, @"\s{2,}");
+                if (parts.Length >= 2)
+                {
+                    string n = parts[0].Trim();
+                    string id = parts[1].Trim();
+                    if (n.Length > 0 && IsIdLike(id))
+                    {
+                        list.Add(new Candidate { Name = n, Id = id });
+                        continue;
+                    }
+                }
+
+                // 空格数量不够时用正则兜底
                 var m = rowRx.Match(t);
                 if (m.Success)
                 {
-                    list.Add(new Candidate
-                    {
-                        Name = m.Groups["name"].Value.Trim(),
-                        Id = m.Groups["id"].Value.Trim()
-                    });
+                    string id = m.Groups["id"].Value.Trim();
+                    string n = m.Groups["name"].Value.Trim();
+                    if (n.Length > 0 && IsIdLike(id))
+                        list.Add(new Candidate { Name = n, Id = id });
                 }
             }
             return list;
+        }
+
+        private static bool IsIdLike(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return false;
+            if (s.Contains(" ")) return false;
+            return s.Contains(".") && Regex.IsMatch(s, @"^[A-Za-z0-9][A-Za-z0-9_\-\.]*$");
         }
 
         private static string CleanLine(string s)
