@@ -5,15 +5,41 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
+using Microsoft.Win32;
 
 namespace SoftwareAssistant
 {
+    public class Candidate
+    {
+        public string Name { get; set; }
+        public string Id { get; set; }
+        public string Source { get; set; }
+        public double MatchScore { get; set; }
+    }
+
+    public class InstalledApp
+    {
+        public string Name { get; set; }
+        public string Version { get; set; }
+        public string ExePath { get; set; }
+        public string Uninstall { get; set; }
+        public string Location { get; set; }
+        public ImageSource Icon { get; set; }
+    }
+
     public partial class MainWindow : Window
     {
         // 中文常用名 -> 英文检索词
@@ -49,18 +75,44 @@ namespace SoftwareAssistant
         };
 
         private LlmConfig _llm;
+        private DispatcherTimer _suggestTimer;
+        private int _suggestSeq;
+        private List<InstalledApp> _installed = new List<InstalledApp>();
+        private readonly Dictionary<string, ImageSource> _iconCache = new Dictionary<string, ImageSource>(StringComparer.OrdinalIgnoreCase);
 
         public MainWindow()
         {
             InitializeComponent();
+
             if (!IsAdministrator())
             {
                 MessageBox.Show("请右键点击软件，选择【以管理员身份运行】，否则无法安装软件！", "需要管理员权限", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
+
             _llm = LoadConfig();
+
+            _suggestTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(450) };
+            _suggestTimer.Tick += SuggestTimer_Tick;
+
+            var cm = new ContextMenu();
+            var miStart = new MenuItem { Header = "启动" };
+            miStart.Click += delegate { StartSelected(); };
+            var miFolder = new MenuItem { Header = "打开文件所在目录" };
+            miFolder.Click += delegate { OpenFolderSelected(); };
+            var miUninstall = new MenuItem { Header = "卸载" };
+            miUninstall.Click += delegate { UninstallSelected(); };
+            cm.Items.Add(miStart);
+            cm.Items.Add(miFolder);
+            cm.Items.Add(new Separator());
+            cm.Items.Add(miUninstall);
+            InstalledList.ContextMenu = cm;
+
+            InstalledList.MouseDoubleClick += delegate { StartSelected(); };
+
+            LoadInstalledAsync();
         }
 
-        // ---------------- 可选的大模型辅助（默认智谱 GLM-4-Flash） ----------------
+        // ================= 配置文件（便携优先） =================
 
         private sealed class LlmConfig
         {
@@ -69,12 +121,26 @@ namespace SoftwareAssistant
             public string Model { get; set; }
         }
 
-        private static string ConfigPath
+        private static string PortableConfigPath
+        {
+            get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json"); }
+        }
+
+        private static string RoamingConfigPath
         {
             get
             {
-                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SoftwareAssistant");
-                return Path.Combine(dir, "config.json");
+                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                                    "SoftwareAssistant", "config.json");
+            }
+        }
+
+        private static string ActiveConfigPath
+        {
+            get
+            {
+                if (File.Exists(PortableConfigPath)) return PortableConfigPath;
+                return RoamingConfigPath;
             }
         }
 
@@ -82,12 +148,15 @@ namespace SoftwareAssistant
         {
             try
             {
-                if (!File.Exists(ConfigPath)) return null;
-                string json = File.ReadAllText(ConfigPath, Encoding.UTF8);
+                string path = ActiveConfigPath;
+                if (!File.Exists(path)) return null;
+
+                string json = File.ReadAllText(path, Encoding.UTF8);
                 var cfg = JsonSerializer.Deserialize<LlmConfig>(json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
                 if (cfg == null || string.IsNullOrWhiteSpace(cfg.ApiKey)) return null;
+
                 if (string.IsNullOrWhiteSpace(cfg.BaseUrl)) cfg.BaseUrl = "https://open.bigmodel.cn/api/paas/v4";
-                if (string.IsNullOrWhiteSpace(cfg.Model)) cfg.Model = "glm-4-flash";
+                if (string.IsNullOrWhiteSpace(cfg.Model)) cfg.Model = "glm-5.3-flash";
                 return cfg;
             }
             catch { return null; }
@@ -127,7 +196,6 @@ namespace SoftwareAssistant
             }
         }
 
-        // 只在真实候选里挑，避免模型编造包名
         private int AskBestIndex(string term, List<Candidate> cands)
         {
             if (_llm == null || cands.Count < 2) return -1;
@@ -140,7 +208,7 @@ namespace SoftwareAssistant
                 sb.AppendLine("候选列表：");
                 for (int i = 0; i < limit; i++)
                     sb.AppendLine(string.Format("{0}. {1} ({2})", i + 1, cands[i].Name, cands[i].Id));
-                sb.AppendLine("规则：只能从上面选。只输出一个数字——最匹配候选的序号（从 1 开始）；如果都不匹配，输出 0。不要输出任何解释。");
+                sb.AppendLine("规则：只能从上面选。只输出一个数字——最匹配候选的序号（从 1 开始）；都不匹配输出 0。不要输出解释。");
 
                 string ans = AskLlm(_llm, "你是软件包匹配助手，负责从候选清单中挑出用户最可能想安装的那个软件。", sb.ToString());
                 var m = Regex.Match(ans ?? "", @"\d+");
@@ -157,7 +225,6 @@ namespace SoftwareAssistant
             }
         }
 
-        // 搜不到时，让模型给替代关键词
         private List<string> AskQueries(string term)
         {
             var result = new List<string>();
@@ -183,7 +250,317 @@ namespace SoftwareAssistant
             return result.Distinct(StringComparer.OrdinalIgnoreCase).Take(3).ToList();
         }
 
-        // ---------------- 主流程 ----------------
+        // ================= 自动补全 =================
+
+        private void InputTextBox_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (_suggestTimer == null) return;
+            _suggestTimer.Stop();
+            _suggestTimer.Start();
+        }
+
+        private async void SuggestTimer_Tick(object sender, EventArgs e)
+        {
+            _suggestTimer.Stop();
+
+            string line = CurrentLineText().Trim();
+            if (line.Length < 2 || IsUrl(line))
+            {
+                SuggestionPopup.IsOpen = false;
+                return;
+            }
+
+            int seq = ++_suggestSeq;
+
+            List<Candidate> found;
+            try
+            {
+                found = await Task.Run(() => SearchAll(BuildQueries(line), true)
+                                            .OrderByDescending(c => Score(line, c.Name))
+                                            .ThenByDescending(c => c.MatchScore)
+                                            .Take(6)
+                                            .ToList());
+            }
+            catch { return; }
+
+            if (seq != _suggestSeq) return;
+
+            if (found.Count == 0)
+            {
+                SuggestionPopup.IsOpen = false;
+                return;
+            }
+
+            SuggestionList.ItemsSource = found;
+            SuggestionList.SelectedIndex = -1;
+            SuggestionPopup.IsOpen = true;
+        }
+
+        private string CurrentLineText()
+        {
+            string text = InputTextBox.Text ?? "";
+            if (text.Length == 0) return "";
+
+            int caret = Math.Max(0, Math.Min(InputTextBox.CaretIndex, text.Length));
+            int start = text.LastIndexOf('\n', Math.Max(0, caret - 1));
+            start = start < 0 ? 0 : start + 1;
+            int end = text.IndexOf('\n', Math.Min(caret, text.Length - 1));
+            if (end < 0) end = text.Length;
+            if (end < start) end = start;
+
+            return text.Substring(start, end - start);
+        }
+
+        private void ReplaceCurrentLine(string newText)
+        {
+            string text = InputTextBox.Text ?? "";
+            if (text.Length == 0) { InputTextBox.Text = newText; return; }
+
+            int caret = Math.Max(0, Math.Min(InputTextBox.CaretIndex, text.Length));
+            int start = text.LastIndexOf('\n', Math.Max(0, caret - 1));
+            start = start < 0 ? 0 : start + 1;
+            int end = text.IndexOf('\n', Math.Min(caret, text.Length - 1));
+            if (end < 0) end = text.Length;
+            if (end < start) end = start;
+
+            InputTextBox.Text = text.Substring(0, start) + newText + text.Substring(end);
+            InputTextBox.CaretIndex = start + newText.Length;
+        }
+
+        private void SuggestionList_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            ApplySuggestion();
+        }
+
+        private void SuggestionList_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Enter) { ApplySuggestion(); e.Handled = true; }
+            else if (e.Key == Key.Escape) { SuggestionPopup.IsOpen = false; e.Handled = true; }
+        }
+
+        private void ApplySuggestion()
+        {
+            var c = SuggestionList.SelectedItem as Candidate;
+            if (c == null) return;
+            SuggestionPopup.IsOpen = false;
+            ReplaceCurrentLine(c.Id);
+        }
+
+        // ================= 已安装软件 =================
+
+        private void RefreshButton_Click(object sender, RoutedEventArgs e)
+        {
+            LoadInstalledAsync();
+        }
+
+        private void LoadInstalledAsync()
+        {
+            InstalledCount.Text = "加载中…";
+            Task.Run(() => LoadInstalledApps()).ContinueWith(t =>
+            {
+                var list = t.Result ?? new List<InstalledApp>();
+                Dispatcher.Invoke(() =>
+                {
+                    _installed = list;
+                    ApplyInstalledFilter();
+                });
+            });
+        }
+
+        private void InstalledFilter_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            ApplyInstalledFilter();
+        }
+
+        private void ApplyInstalledFilter()
+        {
+            string key = (InstalledFilter.Text ?? "").Trim();
+
+            var view = string.IsNullOrEmpty(key)
+                ? _installed
+                : _installed.Where(a => a.Name.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0).ToList();
+
+            foreach (var a in view) a.Icon = GetIcon(a.ExePath);
+
+            InstalledList.ItemsSource = null;
+            InstalledList.ItemsSource = view;
+            InstalledCount.Text = string.Format("{0} 个软件", view.Count);
+        }
+
+        private ImageSource GetIcon(string exePath)
+        {
+            if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath)) return null;
+
+            if (_iconCache.ContainsKey(exePath)) return _iconCache[exePath];
+
+            ImageSource src = null;
+            try
+            {
+                var shfi = new SHFILEINFO();
+                IntPtr res = SHGetFileInfo(exePath, 0, ref shfi, (uint)Marshal.SizeOf(shfi),
+                                           SHGFI_ICON | SHGFI_SMALLICON);
+                if (res != IntPtr.Zero && shfi.hIcon != IntPtr.Zero)
+                {
+                    var bmp = Imaging.CreateBitmapSourceFromHIcon(shfi.hIcon, Int32Rect.Empty,
+                                                                  BitmapSizeOptions.FromEmptyOptions());
+                    bmp.Freeze();
+                    src = bmp;
+                    DestroyIcon(shfi.hIcon);
+                }
+            }
+            catch { }
+
+            _iconCache[exePath] = src;
+            return src;
+        }
+
+        private void InstalledList_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            var item = ItemsControl.ContainerFromElement(InstalledList, (DependencyObject)e.OriginalSource) as ListBoxItem;
+            if (item != null) item.IsSelected = true;
+        }
+
+        private InstalledApp SelectedApp()
+        {
+            return InstalledList.SelectedItem as InstalledApp;
+        }
+
+        private void StartSelected()
+        {
+            var app = SelectedApp();
+            if (app == null) return;
+
+            if (!string.IsNullOrEmpty(app.ExePath) && File.Exists(app.ExePath))
+            {
+                try { Process.Start(new ProcessStartInfo(app.ExePath) { UseShellExecute = true }); }
+                catch (Exception ex) { AppendLog("启动失败: " + ex.Message); }
+            }
+            else
+            {
+                AppendLog("找不到该软件的启动程序: " + app.Name);
+            }
+        }
+
+        private void OpenFolderSelected()
+        {
+            var app = SelectedApp();
+            if (app == null) return;
+
+            string dir = app.Location;
+            if (string.IsNullOrEmpty(dir) && !string.IsNullOrEmpty(app.ExePath))
+                dir = Path.GetDirectoryName(app.ExePath);
+
+            if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
+            {
+                try { Process.Start("explorer.exe", "\"" + dir + "\""); }
+                catch (Exception ex) { AppendLog("打开目录失败: " + ex.Message); }
+            }
+            else
+            {
+                AppendLog("找不到该软件的安装目录: " + app.Name);
+            }
+        }
+
+        private void UninstallSelected()
+        {
+            var app = SelectedApp();
+            if (app == null) return;
+
+            if (string.IsNullOrEmpty(app.Uninstall))
+            {
+                AppendLog("该软件没有登记卸载命令: " + app.Name);
+                return;
+            }
+
+            try
+            {
+                Process.Start(new ProcessStartInfo("cmd.exe", "/c " + app.Uninstall) { UseShellExecute = true });
+            }
+            catch (Exception ex) { AppendLog("卸载启动失败: " + ex.Message); }
+        }
+
+        private static List<InstalledApp> LoadInstalledApps()
+        {
+            var list = new List<InstalledApp>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            var roots = new List<RegistryKey>();
+            try { roots.Add(Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")); } catch { }
+            try { roots.Add(Registry.LocalMachine.OpenSubKey(@"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall")); } catch { }
+            try { roots.Add(Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")); } catch { }
+
+            foreach (var root in roots)
+            {
+                if (root == null) continue;
+
+                foreach (var name in root.GetSubKeyNames())
+                {
+                    RegistryKey sub = null;
+                    try
+                    {
+                        sub = root.OpenSubKey(name);
+                        if (sub == null) continue;
+
+                        string displayName = sub.GetValue("DisplayName") as string;
+                        if (string.IsNullOrWhiteSpace(displayName)) continue;
+
+                        object sysComp = sub.GetValue("SystemComponent");
+                        if (sysComp != null && Convert.ToInt32(sysComp) == 1) continue;
+
+                        if (displayName.StartsWith("Update for", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (displayName.StartsWith("KB", StringComparison.OrdinalIgnoreCase)) continue;
+
+                        string version = sub.GetValue("DisplayVersion") as string ?? "";
+                        string displayIcon = sub.GetValue("DisplayIcon") as string ?? "";
+                        string uninstall = sub.GetValue("QuietUninstallString") as string;
+                        if (string.IsNullOrWhiteSpace(uninstall))
+                            uninstall = sub.GetValue("UninstallString") as string ?? "";
+                        string location = sub.GetValue("InstallLocation") as string ?? "";
+
+                        string exePath = ExtractExePath(displayIcon);
+
+                        string key = displayName + "|" + version;
+                        if (!seen.Add(key)) continue;
+
+                        list.Add(new InstalledApp
+                        {
+                            Name = displayName.Trim(),
+                            Version = version,
+                            ExePath = exePath,
+                            Uninstall = uninstall,
+                            Location = location
+                        });
+                    }
+                    catch { }
+                    finally { if (sub != null) sub.Dispose(); }
+                }
+            }
+
+            return list.OrderBy(a => a.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        private static string ExtractExePath(string displayIcon)
+        {
+            if (string.IsNullOrWhiteSpace(displayIcon)) return null;
+
+            string p = displayIcon.Trim().Trim('"');
+
+            int comma = p.LastIndexOf(',');
+            if (comma > 2) p = p.Substring(0, comma).Trim().Trim('"');
+
+            if (p.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && File.Exists(p)) return p;
+
+            int idx = p.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+            if (idx > 0)
+            {
+                string cut = p.Substring(0, idx + 4).Trim().Trim('"');
+                if (File.Exists(cut)) return cut;
+            }
+
+            return null;
+        }
+
+        // ================= 主流程 =================
 
         private void StartButton_Click(object sender, RoutedEventArgs e)
         {
@@ -197,10 +574,11 @@ namespace SoftwareAssistant
 
             if (list.Count == 0) return;
 
+            SuggestionPopup.IsOpen = false;
             StartButton.IsEnabled = false;
             LogTextBox.Text = "开始执行...\r\n";
             AppendLog(_llm == null
-                ? "提示: 未配置大模型，使用本地模糊匹配。配置文件: " + ConfigPath
+                ? "提示: 未配置大模型，使用本地模糊匹配。配置路径: " + ActiveConfigPath
                 : "提示: 已启用大模型辅助（" + _llm.Model + "）");
             SetProgress(0, "准备中");
 
@@ -222,7 +600,7 @@ namespace SoftwareAssistant
                 AppendLog("\r\n========================================");
                 AppendLog(string.Format("全部完成！成功: {0} 个，失败/跳过: {1} 个。", ok, fail));
                 SetProgress(100, string.Format("完成 · 成功 {0} / 失败 {1}", ok, fail));
-                Dispatcher.Invoke(() => StartButton.IsEnabled = true);
+                Dispatcher.Invoke(delegate { StartButton.IsEnabled = true; });
             });
         }
 
@@ -244,8 +622,6 @@ namespace SoftwareAssistant
             return false;
         }
 
-        // ---------------- winget + 模糊匹配 ----------------
-
         private bool TryWinget(string term)
         {
             if (LooksLikeId(term))
@@ -262,7 +638,7 @@ namespace SoftwareAssistant
             }
 
             var queries = BuildQueries(term);
-            var all = SearchAll(queries);
+            var all = SearchAll(queries, false);
 
             if (all.Count == 0 && _llm != null)
             {
@@ -270,7 +646,7 @@ namespace SoftwareAssistant
                 if (extra.Count > 0)
                 {
                     AppendLog("    winget 无结果，大模型建议检索词: " + string.Join(" / ", extra));
-                    all = SearchAll(extra);
+                    all = SearchAll(extra, false);
                 }
             }
 
@@ -322,15 +698,19 @@ namespace SoftwareAssistant
             return false;
         }
 
-        private List<Candidate> SearchAll(List<string> queries)
+        private List<Candidate> SearchAll(List<string> queries, bool quiet)
         {
             var all = new List<Candidate>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var q in queries)
             {
-                AppendLog("    → 搜索关键词: " + q);
-                SetIndeterminate("搜索: " + q);
+                if (!quiet)
+                {
+                    AppendLog("    → 搜索关键词: " + q);
+                    SetIndeterminate("搜索: " + q);
+                }
+
                 RunProcess("winget", "search \"" + q + "\" --accept-source-agreements", out string so);
 
                 foreach (var c in ParseWinget(so))
@@ -339,14 +719,6 @@ namespace SoftwareAssistant
                 }
             }
             return all;
-        }
-
-        private sealed class Candidate
-        {
-            public string Name { get; set; }
-            public string Id { get; set; }
-            public string Source { get; set; }
-            public double MatchScore { get; set; }
         }
 
         private static List<string> BuildQueries(string term)
@@ -486,7 +858,7 @@ namespace SoftwareAssistant
             return s.Contains(".") && Regex.IsMatch(s, @"^[A-Za-z0-9][A-Za-z0-9_\-\.]*$");
         }
 
-        // ---------------- Chocolatey ----------------
+        // ================= Chocolatey =================
 
         private bool TryChoco(string term)
         {
@@ -547,7 +919,7 @@ namespace SoftwareAssistant
             return list;
         }
 
-        // ---------------- Scoop ----------------
+        // ================= Scoop =================
 
         private bool TryScoop(string term)
         {
@@ -577,7 +949,7 @@ namespace SoftwareAssistant
             return false;
         }
 
-        // ---------------- 直链下载 ----------------
+        // ================= 直链下载 =================
 
         private static bool IsUrl(string s)
         {
@@ -599,11 +971,13 @@ namespace SoftwareAssistant
                     wc.Headers.Add("User-Agent", "Mozilla/5.0");
                     var tcs = new TaskCompletionSource<bool>();
 
-                    wc.DownloadProgressChanged += (s, ev) =>
+                    wc.DownloadProgressChanged += delegate(object s, DownloadProgressChangedEventArgs ev)
+                    {
                         SetProgress(ev.ProgressPercentage, string.Format("下载中 {0}%  ({1:0.0} MB / {2:0.0} MB)",
                             ev.ProgressPercentage, ev.BytesReceived / 1048576.0, ev.TotalBytesToReceive / 1048576.0));
+                    };
 
-                    wc.DownloadFileCompleted += (s, ev) =>
+                    wc.DownloadFileCompleted += delegate(object s, System.ComponentModel.AsyncCompletedEventArgs ev)
                     {
                         if (ev.Error != null) tcs.TrySetException(ev.Error);
                         else if (ev.Cancelled) tcs.TrySetCanceled();
@@ -631,11 +1005,11 @@ namespace SoftwareAssistant
             }
         }
 
-        // ---------------- 进度条 ----------------
+        // ================= 进度条 =================
 
         private void SetProgress(double percent, string status)
         {
-            Dispatcher.Invoke(() =>
+            Dispatcher.Invoke(delegate
             {
                 Progress.IsIndeterminate = false;
                 Progress.Value = Math.Max(0, Math.Min(100, percent));
@@ -645,14 +1019,37 @@ namespace SoftwareAssistant
 
         private void SetIndeterminate(string status)
         {
-            Dispatcher.Invoke(() =>
+            Dispatcher.Invoke(delegate
             {
                 Progress.IsIndeterminate = true;
                 StatusText.Text = status;
             });
         }
 
-        // ---------------- 通用 ----------------
+        // ================= 通用 =================
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct SHFILEINFO
+        {
+            public IntPtr hIcon;
+            public int iIcon;
+            public uint dwAttributes;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string szDisplayName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)]
+            public string szTypeName;
+        }
+
+        private const uint SHGFI_ICON = 0x000000100;
+        private const uint SHGFI_SMALLICON = 0x000000001;
+        private const uint SHGFI_USEFILEATTRIBUTES = 0x000000010;
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr SHGetFileInfo(string pszPath, uint dwFileAttributes,
+            ref SHFILEINFO psfi, uint cbFileInfo, uint uFlags);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool DestroyIcon(IntPtr hIcon);
 
         private static bool HasCommand(string name)
         {
@@ -702,8 +1099,8 @@ namespace SoftwareAssistant
                 {
                     string stdout = "";
                     string stderr = "";
-                    var t1 = Task.Run(() => { stdout = p.StandardOutput.ReadToEnd(); });
-                    var t2 = Task.Run(() => { stderr = p.StandardError.ReadToEnd(); });
+                    var t1 = Task.Run(delegate { stdout = p.StandardOutput.ReadToEnd(); });
+                    var t2 = Task.Run(delegate { stderr = p.StandardError.ReadToEnd(); });
                     p.WaitForExit();
                     Task.WaitAll(t1, t2);
                     output = (stdout + "\r\n" + stderr).Trim();
@@ -733,7 +1130,7 @@ namespace SoftwareAssistant
 
         private void AppendLog(string text)
         {
-            Dispatcher.Invoke(() =>
+            Dispatcher.Invoke(delegate
             {
                 LogTextBox.AppendText(text + "\r\n");
                 LogTextBox.ScrollToEnd();
