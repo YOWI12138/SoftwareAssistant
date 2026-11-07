@@ -38,7 +38,7 @@ namespace SoftwareAssistant
                     AppendLog($"\r\n========================================");
                     AppendLog($"正在安装: {cleanApp} ...");
 
-                    string result = RunWinget(cleanApp);
+                    bool result = RunWinget(cleanApp);
                     if (result)
                     {
                         AppendLog($"✅ 成功安装: {cleanApp}");
@@ -67,7 +67,7 @@ namespace SoftwareAssistant
             });
         }
 
-        private string RunWinget(string appId)
+        private bool RunWinget(string appId)
         {
             try
             {
