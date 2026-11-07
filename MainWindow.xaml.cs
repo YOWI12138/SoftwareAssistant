@@ -40,6 +40,8 @@ namespace SoftwareAssistant
         public string Uninstall { get; set; }
         public string Location { get; set; }
         public ImageSource Icon { get; set; }
+        public DateTime? InstallTime { get; set; }
+        public Visibility NewMark { get; set; }
     }
 
     public enum PlanKind { Package, Url, Link, None }
@@ -170,36 +172,59 @@ namespace SoftwareAssistant
             catch { return null; }
         }
 
+        private static readonly HttpClient _http = CreateHttp();
+
+        private static HttpClient CreateHttp()
+        {
+            var c = new HttpClient();
+            c.Timeout = TimeSpan.FromSeconds(60);
+            return c;
+        }
+
         private static string AskLlm(LlmConfig cfg, string systemPrompt, string userPrompt)
         {
-            using (var http = new HttpClient())
+            var payload = new
             {
-                http.Timeout = TimeSpan.FromSeconds(25);
-
-                var payload = new
+                model = cfg.Model,
+                temperature = 0,
+                max_tokens = 256,
+                messages = new object[]
                 {
-                    model = cfg.Model,
-                    temperature = 0,
-                    messages = new object[]
+                    new { role = "system", content = systemPrompt },
+                    new { role = "user", content = userPrompt }
+                }
+            };
+
+            string body = JsonSerializer.Serialize(payload);
+            Exception last = null;
+
+            for (int attempt = 1; attempt <= 2; attempt++)
+            {
+                try
+                {
+                    using (var req = new HttpRequestMessage(HttpMethod.Post, cfg.BaseUrl.TrimEnd('/') + "/chat/completions"))
                     {
-                        new { role = "system", content = systemPrompt },
-                        new { role = "user", content = userPrompt }
+                        req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + cfg.ApiKey);
+                        req.Content = new StringContent(body, Encoding.UTF8, "application/json");
+
+                        var resp = _http.Send(req);
+                        string text = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+
+                        if (!resp.IsSuccessStatusCode)
+                            throw new Exception("HTTP " + (int)resp.StatusCode + ": " + (text.Length > 160 ? text.Substring(0, 160) : text));
+
+                        using (var doc = JsonDocument.Parse(text))
+                            return doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
                     }
-                };
-
-                var req = new HttpRequestMessage(HttpMethod.Post, cfg.BaseUrl.TrimEnd('/') + "/chat/completions");
-                req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + cfg.ApiKey);
-                req.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-
-                var resp = http.Send(req);
-                string text = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-
-                if (!resp.IsSuccessStatusCode)
-                    throw new Exception("HTTP " + (int)resp.StatusCode + ": " + (text.Length > 160 ? text.Substring(0, 160) : text));
-
-                using (var doc = JsonDocument.Parse(text))
-                    return doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
+                }
+                catch (Exception ex)
+                {
+                    last = ex;
+                    if (attempt == 1) System.Threading.Thread.Sleep(1200);
+                }
             }
+
+            throw last ?? new Exception("未知错误");
         }
 
         private int AskBestIndex(string term, List<Candidate> cands)
@@ -609,6 +634,35 @@ namespace SoftwareAssistant
             catch (Exception ex) { AppendLog("卸载启动失败: " + ex.Message); }
         }
 
+        [DllImport("advapi32.dll", EntryPoint = "RegQueryInfoKeyW", CharSet = CharSet.Unicode)]
+        private static extern int RegQueryInfoKey(
+            IntPtr hKey, IntPtr lpClass, IntPtr lpcchClass, IntPtr lpReserved,
+            out uint lpcSubKeys, out uint lpcbMaxSubKeyLen, out uint lpcbMaxClassLen,
+            out uint lpcValues, out uint lpcbMaxValueNameLen, out uint lpcbMaxValueLen,
+            out uint lpcbSecurityDescriptor, out long lpftLastWriteTime);
+
+        private static DateTime? GetKeyWriteTime(RegistryKey key)
+        {
+            try
+            {
+                long ft;
+                uint a, b, c, d, e, f, g;
+                int rc = RegQueryInfoKey(key.Handle.DangerousGetHandle(), IntPtr.Zero, IntPtr.Zero, IntPtr.Zero,
+                                         out a, out b, out c, out d, out e, out f, out g, out ft);
+                if (rc != 0 || ft <= 0) return null;
+                return DateTime.FromFileTimeUtc(ft).ToLocalTime();
+            }
+            catch { return null; }
+        }
+
+        private static bool IsVCRedist(string name)
+        {
+            if (name.IndexOf("Visual C++", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            if (name.IndexOf("Visual C + +", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            if (name.IndexOf("Microsoft Visual C++", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            return false;
+        }
+
         private static List<InstalledApp> LoadInstalledApps()
         {
             var list = new List<InstalledApp>();
@@ -638,6 +692,7 @@ namespace SoftwareAssistant
                         if (sysComp != null && Convert.ToInt32(sysComp) == 1) continue;
                         if (displayName.StartsWith("Update for", StringComparison.OrdinalIgnoreCase)) continue;
                         if (displayName.StartsWith("KB", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (IsVCRedist(displayName)) continue;
 
                         string version = sub.GetValue("DisplayVersion") as string ?? "";
                         string displayIcon = sub.GetValue("DisplayIcon") as string ?? "";
@@ -649,13 +704,24 @@ namespace SoftwareAssistant
                         string key = displayName + "|" + version;
                         if (!seen.Add(key)) continue;
 
+                        DateTime? installed = GetKeyWriteTime(sub);
+                        string installDate = sub.GetValue("InstallDate") as string;
+                        if (!installed.HasValue && !string.IsNullOrWhiteSpace(installDate) && installDate.Length == 8)
+                        {
+                            DateTime parsed;
+                            if (DateTime.TryParseExact(installDate, "yyyyMMdd", null,
+                                    System.Globalization.DateTimeStyles.None, out parsed))
+                                installed = parsed;
+                        }
+
                         list.Add(new InstalledApp
                         {
                             Name = displayName.Trim(),
                             Version = version,
                             ExePath = ExtractExePath(displayIcon),
                             Uninstall = uninstall,
-                            Location = location
+                            Location = location,
+                            InstallTime = installed
                         });
                     }
                     catch { }
@@ -663,7 +729,17 @@ namespace SoftwareAssistant
                 }
             }
 
-            return list.OrderBy(a => a.Name, StringComparer.OrdinalIgnoreCase).ToList();
+            DateTime now = DateTime.Now;
+            foreach (var a in list)
+            {
+                a.NewMark = (a.InstallTime.HasValue && (now - a.InstallTime.Value).TotalHours < 1.0)
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+            }
+
+            return list.OrderByDescending(a => a.InstallTime ?? DateTime.MinValue)
+                       .ThenBy(a => a.Name, StringComparer.OrdinalIgnoreCase)
+                       .ToList();
         }
 
         private static string ExtractExePath(string displayIcon)
@@ -967,7 +1043,7 @@ namespace SoftwareAssistant
                 AppendLog("\r\n========================================");
                 AppendLog(string.Format("全部完成！成功: {0} 个，失败/跳过: {1} 个。", ok, fail));
                 SetProgress(100, string.Format("完成 · 成功 {0} / 失败 {1}", ok, fail));
-                Dispatcher.Invoke(delegate { StartButton.IsEnabled = true; PreviewButton.IsEnabled = true; });
+                Dispatcher.Invoke(delegate { StartButton.IsEnabled = true; PreviewButton.IsEnabled = true; LoadInstalledAsync(); });
             });
         }
 
@@ -1013,7 +1089,7 @@ namespace SoftwareAssistant
                 AppendLog("\r\n========================================");
                 AppendLog(string.Format("全部完成！成功: {0} 个，失败/跳过: {1} 个。", ok, fail));
                 SetProgress(100, string.Format("完成 · 成功 {0} / 失败 {1}", ok, fail));
-                Dispatcher.Invoke(delegate { StartButton.IsEnabled = true; PreviewButton.IsEnabled = true; });
+                Dispatcher.Invoke(delegate { StartButton.IsEnabled = true; PreviewButton.IsEnabled = true; LoadInstalledAsync(); });
             });
         }
 
