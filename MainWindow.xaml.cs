@@ -66,9 +66,9 @@ namespace SoftwareAssistant
                 AppendLastLines(idOut, 3);
             }
 
-            // 2) 按关键词搜索
-            AppendLog("  → 搜索匹配的软件");
-            RunWingetRaw("search --source winget \"" + term + "\"", out string searchOut);
+            // 2) 按关键词搜索（不限源：同时覆盖 winget 社区源和 Microsoft Store 源）
+            AppendLog("  → 搜索匹配的软件（winget + msstore）");
+            RunWingetRaw("search \"" + term + "\"", out string searchOut);
             var candidates = ParseSearch(searchOut);
 
             if (candidates.Count == 0)
@@ -80,8 +80,8 @@ namespace SoftwareAssistant
             }
 
             AppendLog(string.Format("  → 找到 {0} 个候选", candidates.Count));
-            foreach (var c in candidates.Take(5))
-                AppendLog(string.Format("      · {0}  ({1})", c.Name, c.Id));
+            foreach (var c in candidates.Take(6))
+                AppendLog(string.Format("      · {0}  ({1}){2}", c.Name, c.Id, string.IsNullOrEmpty(c.Source) ? "" : "  [" + c.Source + "]"));
 
             var pick = candidates.FirstOrDefault(c => string.Equals(c.Name.Trim(), term, StringComparison.OrdinalIgnoreCase));
             if (pick == null) pick = candidates[0];
@@ -108,6 +108,7 @@ namespace SoftwareAssistant
         {
             public string Name { get; set; }
             public string Id { get; set; }
+            public string Source { get; set; }
         }
 
         private static List<Candidate> ParseSearch(string output)
@@ -115,8 +116,8 @@ namespace SoftwareAssistant
             var list = new List<Candidate>();
             if (string.IsNullOrEmpty(output)) return list;
 
-            // 兜底用的正则：兼容 2 列 / 3 列 / 4 列三种表头
-            var rowRx = new Regex(@"^(?<name>.+?)\s+(?<id>[A-Za-z0-9][A-Za-z0-9_\-\.]*\.[A-Za-z0-9_\-\.]+)(\s+(?<ver>\S+))?(\s+(?<src>winget|msstore))?\s*$");
+            // 兜底正则：兼容 3 列（无 Source）和 4 列（带 Source）两种表头
+            var rowRx = new Regex(@"^(?<name>.+?)\s+(?<id>[A-Za-z0-9][A-Za-z0-9_\-\.]*\.[A-Za-z0-9_\-\.]+|[0-9A-Z]{12})(\s+(?<ver>\S+))?(\s+(?<src>winget|msstore))?\s*$");
 
             foreach (var rawLine in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
             {
@@ -136,7 +137,8 @@ namespace SoftwareAssistant
                     string id = parts[1].Trim();
                     if (n.Length > 0 && IsIdLike(id))
                     {
-                        list.Add(new Candidate { Name = n, Id = id });
+                        string src = parts.Length >= 4 ? parts[3].Trim() : "";
+                        list.Add(new Candidate { Name = n, Id = id, Source = src });
                         continue;
                     }
                 }
@@ -148,7 +150,14 @@ namespace SoftwareAssistant
                     string id = m.Groups["id"].Value.Trim();
                     string n = m.Groups["name"].Value.Trim();
                     if (n.Length > 0 && IsIdLike(id))
-                        list.Add(new Candidate { Name = n, Id = id });
+                    {
+                        list.Add(new Candidate
+                        {
+                            Name = n,
+                            Id = id,
+                            Source = m.Groups["src"].Success ? m.Groups["src"].Value.Trim() : ""
+                        });
+                    }
                 }
             }
             return list;
@@ -158,6 +167,8 @@ namespace SoftwareAssistant
         {
             if (string.IsNullOrEmpty(s)) return false;
             if (s.Contains(" ")) return false;
+            // 社区源形如 Publisher.Product；Store 源是 12 位字母数字
+            if (Regex.IsMatch(s, @"^[0-9A-Z]{12}$")) return true;
             return s.Contains(".") && Regex.IsMatch(s, @"^[A-Za-z0-9][A-Za-z0-9_\-\.]*$");
         }
 
