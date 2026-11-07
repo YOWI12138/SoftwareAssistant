@@ -187,7 +187,7 @@ namespace SoftwareAssistant
             {
                 model = cfg.Model,
                 temperature = 0,
-                max_tokens = 256,
+                max_tokens = 1024,
                 messages = new object[]
                 {
                     new { role = "system", content = systemPrompt },
@@ -214,7 +214,20 @@ namespace SoftwareAssistant
                             throw new Exception("HTTP " + (int)resp.StatusCode + ": " + (text.Length > 160 ? text.Substring(0, 160) : text));
 
                         using (var doc = JsonDocument.Parse(text))
-                            return doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
+                        {
+                            var msg = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
+
+                            string content = null;
+                            JsonElement ce;
+                            if (msg.TryGetProperty("content", out ce) && ce.ValueKind == JsonValueKind.String)
+                                content = ce.GetString();
+
+                            JsonElement re;
+                            if (string.IsNullOrWhiteSpace(content) && msg.TryGetProperty("reasoning_content", out re) && re.ValueKind == JsonValueKind.String)
+                                content = re.GetString();
+
+                            return content ?? "";
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -271,6 +284,13 @@ namespace SoftwareAssistant
                 {
                     string t = Regex.Replace(line, @"^\s*(\d+[\.\)、]|[-*])\s*", "").Trim();
                     if (t.Length >= 2 && t.Length <= 40) result.Add(t);
+                }
+
+                if (result.Count == 0)
+                {
+                    string raw = ans ?? "";
+                    if (raw.Length > 200) raw = raw.Substring(0, 200);
+                    AppendLog("    模型返回解析不出关键词，原始内容: [" + raw + "]");
                 }
             }
             catch (Exception ex) { AppendLog("    大模型调用失败: " + ex.Message); }
