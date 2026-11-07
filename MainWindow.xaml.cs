@@ -14,6 +14,39 @@ namespace SoftwareAssistant
 {
     public partial class MainWindow : Window
     {
+        // 中文常用名 -> 英文检索词，用于跨语言模糊匹配
+        private static readonly Dictionary<string, string[]> Knowledge = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "微信",     new[] { "WeChat" } },
+            { "企业微信", new[] { "WeCom", "WeChat Work" } },
+            { "qq",       new[] { "QQ", "Tencent QQ" } },
+            { "腾讯qq",   new[] { "Tencent QQ", "QQ" } },
+            { "qq音乐",   new[] { "QQ Music" } },
+            { "钉钉",     new[] { "DingTalk" } },
+            { "腾讯会议", new[] { "Tencent Meeting" } },
+            { "向日葵",   new[] { "SunLogin", "Oray" } },
+            { "网易云音乐", new[] { "NetEase Cloud Music", "CloudMusic" } },
+            { "wps",      new[] { "WPS Office", "Kingsoft" } },
+            { "百度网盘", new[] { "Baidu Netdisk" } },
+            { "迅雷",     new[] { "Thunder", "Xunlei" } },
+            { "爱奇艺",   new[] { "iQIYI" } },
+            { "优酷",     new[] { "Youku" } },
+            { "哔哩哔哩", new[] { "Bilibili" } },
+            { "b站",      new[] { "Bilibili" } },
+            { "抖音",     new[] { "Douyin", "TikTok" } },
+            { "搜狗输入法", new[] { "Sogou Input" } },
+            { "火绒",     new[] { "Huorong" } },
+            { "360",      new[] { "360 Total Security", "360Safe" } },
+            { "谷歌浏览器", new[] { "Google Chrome" } },
+            { "chrome",   new[] { "Google Chrome" } },
+            { "vscode",   new[] { "Visual Studio Code" } },
+            { "python",   new[] { "Python" } },
+            { "steam",    new[] { "Steam" } },
+            { "网易云",   new[] { "NetEase Cloud Music" } },
+            { "剪映",     new[] { "JianYing", "CapCut" } },
+            { "阿里云盘", new[] { "Aliyun Drive", "AliPan" } }
+        };
+
         public MainWindow()
         {
             InitializeComponent();
@@ -27,61 +60,66 @@ namespace SoftwareAssistant
         {
             if (!IsAdministrator()) return;
 
-            string[] apps = InputTextBox.Text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-            if (apps.Length == 0) return;
+            var list = InputTextBox.Text
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(x => x.Trim())
+                .Where(x => x.Length > 0 && !x.StartsWith("#"))
+                .ToList();
+
+            if (list.Count == 0) return;
 
             StartButton.IsEnabled = false;
             LogTextBox.Text = "开始执行...\r\n";
+            SetProgress(0, "准备中");
 
             Task.Run(() =>
             {
                 int ok = 0, fail = 0;
-                foreach (var raw in apps)
+                for (int i = 0; i < list.Count; i++)
                 {
-                    string term = raw.Trim();
-                    if (string.IsNullOrEmpty(term) || term.StartsWith("#")) continue;
-
+                    string term = list[i];
                     AppendLog("\r\n========================================");
-                    AppendLog("正在安装: " + term);
+                    AppendLog(string.Format("[{0}/{1}] 正在安装: {2}", i + 1, list.Count, term));
+                    SetProgress(i * 100.0 / list.Count, string.Format("({0}/{1}) {2}", i + 1, list.Count, term));
 
                     if (InstallOne(term)) ok++; else fail++;
+
+                    SetProgress((i + 1) * 100.0 / list.Count, string.Format("已完成 {0}/{1}", i + 1, list.Count));
                 }
 
                 AppendLog("\r\n========================================");
                 AppendLog(string.Format("全部完成！成功: {0} 个，失败/跳过: {1} 个。", ok, fail));
+                SetProgress(100, string.Format("完成 · 成功 {0} / 失败 {1}", ok, fail));
                 Dispatcher.Invoke(() => StartButton.IsEnabled = true);
             });
         }
 
         private bool InstallOne(string term)
         {
-            // 0) 直链下载
             if (IsUrl(term)) return InstallFromUrl(term);
 
-            // 1) winget（社区源 + Microsoft Store 源）
             AppendLog("  [1/3] winget（winget + msstore）");
             if (TryWinget(term)) return true;
 
-            // 2) Chocolatey
             AppendLog("  [2/3] Chocolatey");
             if (TryChoco(term)) return true;
 
-            // 3) Scoop
             AppendLog("  [3/3] Scoop");
             if (TryScoop(term)) return true;
 
             AppendLog("  ❌ 三个包管理器都没能装上这条。");
-            AppendLog("     兜底办法：把安装包直链粘进来（支持 http/https 的 .exe/.msi）");
+            AppendLog("     兜底：把安装包直链粘进来（http/https 的 .exe/.msi）");
             return false;
         }
 
-        // ---------------- winget ----------------
+        // ---------------- winget + 模糊匹配 ----------------
 
         private bool TryWinget(string term)
         {
             if (LooksLikeId(term))
             {
                 AppendLog("    → 按包 ID 精确安装");
+                SetIndeterminate("安装 " + term);
                 if (RunProcess("winget", "install --id \"" + term + "\" --exact --silent --accept-package-agreements --accept-source-agreements", out string idOut))
                 {
                     AppendLog("    ✅ 成功");
@@ -91,23 +129,49 @@ namespace SoftwareAssistant
                 AppendLastLines(idOut, 2);
             }
 
-            RunProcess("winget", "search \"" + term + "\" --accept-source-agreements", out string searchOut);
-            var candidates = ParseWinget(searchOut);
+            var queries = BuildQueries(term);
+            var all = new List<Candidate>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            if (candidates.Count == 0)
+            foreach (var q in queries)
+            {
+                AppendLog("    → 搜索关键词: " + q);
+                SetIndeterminate("搜索: " + q);
+                RunProcess("winget", "search \"" + q + "\" --accept-source-agreements", out string so);
+                foreach (var c in ParseWinget(so))
+                {
+                    if (seen.Add(c.Id + "|" + c.Name)) all.Add(c);
+                }
+            }
+
+            if (all.Count == 0)
             {
                 AppendLog("    winget 无结果");
                 return false;
             }
 
-            AppendLog(string.Format("    → 找到 {0} 个候选", candidates.Count));
-            foreach (var c in candidates.Take(6))
-                AppendLog(string.Format("       · {0}  ({1}){2}", c.Name, c.Id, string.IsNullOrEmpty(c.Source) ? "" : "  [" + c.Source + "]"));
+            // 打分：原始输入权重最高，别名关键词作为补充
+            foreach (var c in all)
+            {
+                double s = Math.Max(Score(term, c.Name), Score(term, c.Id) * 0.6);
+                if (queries.Count > 1)
+                {
+                    foreach (var q in queries.Skip(1))
+                        s = Math.Max(s, Math.Max(Score(q, c.Name) * 0.95, Score(q, c.Id) * 0.6));
+                }
+                c.MatchScore = s;
+            }
 
-            var pick = candidates.FirstOrDefault(c => string.Equals(c.Name.Trim(), term, StringComparison.OrdinalIgnoreCase));
-            if (pick == null) pick = candidates[0];
+            var top = all.OrderByDescending(c => c.MatchScore).Take(5).ToList();
+            AppendLog(string.Format("    → 共 {0} 个候选，模糊匹配前 {1}：", all.Count, top.Count));
+            foreach (var c in top)
+                AppendLog(string.Format("        {0:0.00}  {1}  ({2}){3}", c.MatchScore, c.Name, c.Id,
+                    string.IsNullOrEmpty(c.Source) ? "" : "  [" + c.Source + "]"));
 
-            AppendLog(string.Format("    → 选择: {0} ({1})", pick.Name, pick.Id));
+            var pick = top[0];
+            AppendLog(string.Format("    → 选择: {0} ({1})  匹配度 {2:0.00}", pick.Name, pick.Id, pick.MatchScore));
+
+            SetIndeterminate("安装 " + pick.Id);
             if (RunProcess("winget", "install --id \"" + pick.Id + "\" --exact --silent --accept-package-agreements --accept-source-agreements", out string installOut))
             {
                 AppendLog("    ✅ 成功");
@@ -124,6 +188,38 @@ namespace SoftwareAssistant
             public string Name { get; set; }
             public string Id { get; set; }
             public string Source { get; set; }
+            public double MatchScore { get; set; }
+        }
+
+        private static List<string> BuildQueries(string term)
+        {
+            var qs = new List<string> { term };
+            string k = Normalize(term);
+            if (k.Length == 0) return qs;
+
+            // 取「最长匹配」的别名，避免 "qq音乐" 被 "qq" 抢先命中
+            string bestKey = null;
+            int bestLen = 0;
+
+            foreach (var kv in Knowledge)
+            {
+                string kk = Normalize(kv.Key);
+                if (kk.Length == 0) continue;
+
+                bool hit = k == kk
+                        || (k.Length >= 2 && k.Contains(kk))
+                        || (kk.Length >= 2 && kk.Contains(k));
+
+                if (hit && kk.Length > bestLen)
+                {
+                    bestLen = kk.Length;
+                    bestKey = kv.Key;
+                }
+            }
+
+            if (bestKey != null) qs.AddRange(Knowledge[bestKey]);
+
+            return qs.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         }
 
         private static List<Candidate> ParseWinget(string output)
@@ -161,10 +257,63 @@ namespace SoftwareAssistant
                     string id = m.Groups["id"].Value.Trim();
                     string n = m.Groups["name"].Value.Trim();
                     if (n.Length > 0 && IsIdLike(id))
-                        list.Add(new Candidate { Name = n, Id = id, Source = m.Groups["src"].Success ? m.Groups["src"].Value.Trim() : "" });
+                        list.Add(new Candidate
+                        {
+                            Name = n,
+                            Id = id,
+                            Source = m.Groups["src"].Success ? m.Groups["src"].Value.Trim() : ""
+                        });
                 }
             }
             return list;
+        }
+
+        private static string Normalize(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            var sb = new StringBuilder(s.Length);
+            foreach (char ch in s.ToLowerInvariant())
+                if (char.IsLetterOrDigit(ch)) sb.Append(ch);
+            return sb.ToString();
+        }
+
+        private static double Score(string term, string candidate)
+        {
+            string a = Normalize(term);
+            string b = Normalize(candidate);
+            if (a.Length == 0 || b.Length == 0) return 0;
+            if (a == b) return 1.0;
+
+            int maxLen = Math.Max(a.Length, b.Length);
+            double sim = 1.0 - (double)Levenshtein(a, b) / maxLen;
+
+            if (b.Contains(a)) sim = Math.Max(sim, 0.80 + 0.20 * ((double)a.Length / b.Length));
+            if (a.Contains(b)) sim = Math.Max(sim, 0.75 + 0.20 * ((double)b.Length / a.Length));
+
+            return Math.Min(1.0, sim);
+        }
+
+        private static int Levenshtein(string a, string b)
+        {
+            if (a.Length == 0) return b.Length;
+            if (b.Length == 0) return a.Length;
+
+            var prev = new int[b.Length + 1];
+            var cur = new int[b.Length + 1];
+
+            for (int j = 0; j <= b.Length; j++) prev[j] = j;
+
+            for (int i = 1; i <= a.Length; i++)
+            {
+                cur[0] = i;
+                for (int j = 1; j <= b.Length; j++)
+                {
+                    int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+                    cur[j] = Math.Min(Math.Min(cur[j - 1] + 1, prev[j] + 1), prev[j - 1] + cost);
+                }
+                var tmp = prev; prev = cur; cur = tmp;
+            }
+            return prev[b.Length];
         }
 
         private static bool LooksLikeId(string s)
@@ -199,6 +348,7 @@ namespace SoftwareAssistant
             }
 
             AppendLog("    搜索 Chocolatey 包库");
+            SetIndeterminate("Chocolatey 搜索 " + key);
             if (!RunProcess("choco", "search " + key + " --limit-output --exact", out string s))
                 RunProcess("choco", "search " + key + " --limit-output", out s);
 
@@ -212,6 +362,7 @@ namespace SoftwareAssistant
             string pick = names.FirstOrDefault(n => string.Equals(n, key, StringComparison.OrdinalIgnoreCase)) ?? names[0];
             AppendLog("    → 选择: " + pick);
 
+            SetIndeterminate("Chocolatey 安装 " + pick);
             if (RunProcess("choco", "install " + pick + " -y --no-progress --limit-output", out string o))
             {
                 AppendLog("    ✅ 成功");
@@ -258,6 +409,7 @@ namespace SoftwareAssistant
             }
 
             AppendLog("    尝试 scoop install " + key);
+            SetIndeterminate("Scoop 安装 " + key);
             if (RunProcess("scoop", "install " + key, out string o))
             {
                 AppendLog("    ✅ 成功");
@@ -290,8 +442,23 @@ namespace SoftwareAssistant
                 using (var wc = new WebClient())
                 {
                     wc.Headers.Add("User-Agent", "Mozilla/5.0");
-                    wc.DownloadFile(url, target);
+                    var tcs = new TaskCompletionSource<bool>();
+
+                    wc.DownloadProgressChanged += (s, ev) =>
+                        SetProgress(ev.ProgressPercentage, string.Format("下载中 {0}%  ({1:0.0} MB / {2:0.0} MB)",
+                            ev.ProgressPercentage, ev.BytesReceived / 1048576.0, ev.TotalBytesToReceive / 1048576.0));
+
+                    wc.DownloadFileCompleted += (s, ev) =>
+                    {
+                        if (ev.Error != null) tcs.TrySetException(ev.Error);
+                        else if (ev.Cancelled) tcs.TrySetCanceled();
+                        else tcs.TrySetResult(true);
+                    };
+
+                    wc.DownloadFileAsync(new Uri(url), target);
+                    tcs.Task.Wait();
                 }
+
                 AppendLog("  → 已下载: " + target);
 
                 if (target.EndsWith(".msi", StringComparison.OrdinalIgnoreCase))
@@ -307,6 +474,27 @@ namespace SoftwareAssistant
                 AppendLog("  ❌ 下载/启动失败: " + ex.Message);
                 return false;
             }
+        }
+
+        // ---------------- 进度条 ----------------
+
+        private void SetProgress(double percent, string status)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                Progress.IsIndeterminate = false;
+                Progress.Value = Math.Max(0, Math.Min(100, percent));
+                StatusText.Text = status;
+            });
+        }
+
+        private void SetIndeterminate(string status)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                Progress.IsIndeterminate = true;
+                StatusText.Text = status;
+            });
         }
 
         // ---------------- 通用 ----------------
