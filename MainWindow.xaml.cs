@@ -13,10 +13,12 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Navigation;
 using System.Windows.Threading;
 using Microsoft.Win32;
 
@@ -40,9 +42,21 @@ namespace SoftwareAssistant
         public ImageSource Icon { get; set; }
     }
 
+    public enum PlanKind { Package, Url, Link, None }
+
+    public class PlanItem
+    {
+        public string Term { get; set; }
+        public PlanKind Kind { get; set; }
+        public Candidate Pick { get; set; }
+        public string Url { get; set; }
+        public string SiteName { get; set; }
+        public string AlternateUrl { get; set; }
+        public string AlternateName { get; set; }
+    }
+
     public partial class MainWindow : Window
     {
-        // 中文常用名 -> 英文检索词
         private static readonly Dictionary<string, string[]> Knowledge = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
         {
             { "微信",     new[] { "WeChat" } },
@@ -69,7 +83,6 @@ namespace SoftwareAssistant
             { "chrome",   new[] { "Google Chrome" } },
             { "vscode",   new[] { "Visual Studio Code" } },
             { "steam",    new[] { "Steam" } },
-            { "网易云",   new[] { "NetEase Cloud Music" } },
             { "剪映",     new[] { "JianYing", "CapCut" } },
             { "阿里云盘", new[] { "Aliyun Drive", "AliPan" } }
         };
@@ -106,13 +119,12 @@ namespace SoftwareAssistant
             cm.Items.Add(new Separator());
             cm.Items.Add(miUninstall);
             InstalledList.ContextMenu = cm;
-
             InstalledList.MouseDoubleClick += delegate { StartSelected(); };
 
             LoadInstalledAsync();
         }
 
-        // ================= 配置文件（便携优先） =================
+        // ================= 配置 =================
 
         private sealed class LlmConfig
         {
@@ -137,11 +149,7 @@ namespace SoftwareAssistant
 
         private static string ActiveConfigPath
         {
-            get
-            {
-                if (File.Exists(PortableConfigPath)) return PortableConfigPath;
-                return RoamingConfigPath;
-            }
+            get { return File.Exists(PortableConfigPath) ? PortableConfigPath : RoamingConfigPath; }
         }
 
         private static LlmConfig LoadConfig()
@@ -190,9 +198,7 @@ namespace SoftwareAssistant
                     throw new Exception("HTTP " + (int)resp.StatusCode + ": " + (text.Length > 160 ? text.Substring(0, 160) : text));
 
                 using (var doc = JsonDocument.Parse(text))
-                {
                     return doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
-                }
             }
         }
 
@@ -242,12 +248,149 @@ namespace SoftwareAssistant
                     if (t.Length >= 2 && t.Length <= 40) result.Add(t);
                 }
             }
-            catch (Exception ex)
-            {
-                AppendLog("    大模型调用失败: " + ex.Message);
-            }
+            catch (Exception ex) { AppendLog("    大模型调用失败: " + ex.Message); }
 
             return result.Distinct(StringComparer.OrdinalIgnoreCase).Take(3).ToList();
+        }
+
+        private static readonly string[] VendorHints =
+        {
+            "winget 包 ID 形如 发布者.产品名，例如 Alibaba.AliWorkbench、Tencent.WeChat、Google.Chrome",
+            "中国厂商常用发布者前缀：Alibaba、Tencent、ByteDance、NetEase、Baidu、Xiaomi、Huawei、Kingsoft、Sogou、Oray、Thunder、Youku、iQIYI、Bilibili",
+            "产品名通常用英文或拼音，不含空格，例如 AliWorkbench、WeChat、DingTalk、SunLogin"
+        };
+
+        private List<string> AskPackageIds(string term)
+        {
+            var result = new List<string>();
+            if (_llm == null) return result;
+
+            try
+            {
+                string ans = AskLlm(_llm,
+                    "你要把用户口述的软件名转换成 winget 包 ID。只输出候选包 ID，每行一个，最多 5 个，从最可能到最不可能，不要解释、不要编号。" +
+                    string.Join("；", VendorHints) + "。",
+                    "软件名：" + term);
+
+                foreach (var line in (ans ?? "").Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string t = Regex.Replace(line, @"^\s*(\d+[\.\)、]|[-*])\s*", "").Trim().TrimEnd('.', '。', ',', '，');
+                    if (Regex.IsMatch(t, @"^[A-Za-z0-9][A-Za-z0-9_\-\.]*\.[A-Za-z0-9_\-\.]+$"))
+                        result.Add(t);
+                }
+            }
+            catch (Exception ex) { AppendLog("    大模型调用失败: " + ex.Message); }
+
+            return result.Distinct(StringComparer.OrdinalIgnoreCase).Take(5).ToList();
+        }
+
+        private void AskOfficialSite(string term, bool isDriver, out string siteName, out string url)
+        {
+            siteName = null;
+            url = null;
+            if (_llm == null) return;
+
+            try
+            {
+                string hint = isDriver
+                    ? "（这是打印机或硬件驱动，请给出厂商官方驱动下载页面；厂商可能是 HP、Canon、Epson、Brother、Ricoh、Kyocera、Lenovo、Samsung、Fuji Xerox、Pantum、奔图）"
+                    : "（请给出该软件的官方网站或官方下载页面）";
+
+                string ans = AskLlm(_llm,
+                    "你是软件与驱动的官方链接助手。只输出一行，格式为：名称|URL。不要输出解释、不要加代码块。",
+                    "目标：" + term + hint);
+
+                string line = (ans ?? "").Trim().Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+                if (string.IsNullOrEmpty(line)) return;
+
+                int bar = line.IndexOf('|');
+                if (bar <= 0) return;
+
+                string name = line.Substring(0, bar).Trim().Trim('`', '"', ' ');
+                string link = line.Substring(bar + 1).Trim().Trim('`', '"', ' ');
+
+                if (link.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                    link.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                {
+                    siteName = string.IsNullOrEmpty(name) ? "官方网站" : name;
+                    url = link;
+                }
+            }
+            catch (Exception ex) { AppendLog("    官网查询失败: " + ex.Message); }
+        }
+
+        // ================= 包 ID 推断与学习 =================
+
+        private Candidate ResolvePackageId(string term)
+        {
+            var cache = LoadAliasCache();
+            if (cache.ContainsKey(term))
+            {
+                string cachedId = cache[term];
+                AppendLog("    → 使用已学习别名: " + term + " = " + cachedId);
+                if (VerifyPackageId(cachedId, out string cachedName))
+                    return new Candidate { Name = cachedName, Id = cachedId, Source = "已学习" };
+                AppendLog("    （缓存已失效，重新推断）");
+            }
+
+            if (_llm == null) return null;
+
+            var guesses = AskPackageIds(term);
+            foreach (var g in guesses)
+            {
+                AppendLog("    → 校验候选包 ID: " + g);
+                if (VerifyPackageId(g, out string displayName))
+                {
+                    AppendLog("    ✅ 存在: " + g + "  (" + displayName + ")");
+                    cache[term] = g;
+                    SaveAliasCache(cache);
+                    return new Candidate { Name = displayName, Id = g, Source = "AI 推断" };
+                }
+            }
+
+            return null;
+        }
+
+        private bool VerifyPackageId(string id, out string displayName)
+        {
+            displayName = id;
+            if (!RunProcess("winget", "show --id \"" + id + "\" --exact --accept-source-agreements", out string o))
+                return false;
+
+            var m = Regex.Match(o ?? "", @"(?:Found|已找到)\s+(?<name>.+?)\s+\[(?<id>[^\]]+)\]");
+            if (m.Success) displayName = m.Groups["name"].Value.Trim();
+            return true;
+        }
+
+        private static string AliasCachePath
+        {
+            get
+            {
+                string dir = Path.GetDirectoryName(ActiveConfigPath);
+                if (string.IsNullOrEmpty(dir)) dir = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+                try { Directory.CreateDirectory(dir); } catch { }
+                return Path.Combine(dir, "aliases.json");
+            }
+        }
+
+        private static Dictionary<string, string> LoadAliasCache()
+        {
+            try
+            {
+                string p = AliasCachePath;
+                if (!File.Exists(p)) return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var d = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(p, Encoding.UTF8));
+                return d == null
+                    ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    : new Dictionary<string, string>(d, StringComparer.OrdinalIgnoreCase);
+            }
+            catch { return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); }
+        }
+
+        private static void SaveAliasCache(Dictionary<string, string> cache)
+        {
+            try { File.WriteAllText(AliasCachePath, JsonSerializer.Serialize(cache), Encoding.UTF8); }
+            catch { }
         }
 
         // ================= 自动补全 =================
@@ -277,7 +420,6 @@ namespace SoftwareAssistant
             {
                 found = await Task.Run(() => SearchAll(BuildQueries(line), true)
                                             .OrderByDescending(c => Score(line, c.Name))
-                                            .ThenByDescending(c => c.MatchScore)
                                             .Take(6)
                                             .ToList());
             }
@@ -285,11 +427,7 @@ namespace SoftwareAssistant
 
             if (seq != _suggestSeq) return;
 
-            if (found.Count == 0)
-            {
-                SuggestionPopup.IsOpen = false;
-                return;
-            }
+            if (found.Count == 0) { SuggestionPopup.IsOpen = false; return; }
 
             SuggestionList.ItemsSource = found;
             SuggestionList.SelectedIndex = -1;
@@ -302,9 +440,10 @@ namespace SoftwareAssistant
             if (text.Length == 0) return "";
 
             int caret = Math.Max(0, Math.Min(InputTextBox.CaretIndex, text.Length));
-            int start = text.LastIndexOf('\n', Math.Max(0, caret - 1));
+            int start = caret - 1;
+            start = start < 0 ? 0 : text.LastIndexOf('\n', start);
             start = start < 0 ? 0 : start + 1;
-            int end = text.IndexOf('\n', Math.Min(caret, text.Length - 1));
+            int end = caret >= text.Length ? text.Length : text.IndexOf('\n', caret);
             if (end < 0) end = text.Length;
             if (end < start) end = start;
 
@@ -317,9 +456,10 @@ namespace SoftwareAssistant
             if (text.Length == 0) { InputTextBox.Text = newText; return; }
 
             int caret = Math.Max(0, Math.Min(InputTextBox.CaretIndex, text.Length));
-            int start = text.LastIndexOf('\n', Math.Max(0, caret - 1));
+            int start = caret - 1;
+            start = start < 0 ? 0 : text.LastIndexOf('\n', start);
             start = start < 0 ? 0 : start + 1;
-            int end = text.IndexOf('\n', Math.Min(caret, text.Length - 1));
+            int end = caret >= text.Length ? text.Length : text.IndexOf('\n', caret);
             if (end < 0) end = text.Length;
             if (end < start) end = start;
 
@@ -359,7 +499,7 @@ namespace SoftwareAssistant
             Task.Run(() => LoadInstalledApps()).ContinueWith(t =>
             {
                 var list = t.Result ?? new List<InstalledApp>();
-                Dispatcher.Invoke(() =>
+                Dispatcher.Invoke(delegate
                 {
                     _installed = list;
                     ApplyInstalledFilter();
@@ -390,7 +530,6 @@ namespace SoftwareAssistant
         private ImageSource GetIcon(string exePath)
         {
             if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath)) return null;
-
             if (_iconCache.ContainsKey(exePath)) return _iconCache[exePath];
 
             ImageSource src = null;
@@ -435,10 +574,7 @@ namespace SoftwareAssistant
                 try { Process.Start(new ProcessStartInfo(app.ExePath) { UseShellExecute = true }); }
                 catch (Exception ex) { AppendLog("启动失败: " + ex.Message); }
             }
-            else
-            {
-                AppendLog("找不到该软件的启动程序: " + app.Name);
-            }
+            else AppendLog("找不到该软件的启动程序: " + app.Name);
         }
 
         private void OpenFolderSelected()
@@ -455,10 +591,7 @@ namespace SoftwareAssistant
                 try { Process.Start("explorer.exe", "\"" + dir + "\""); }
                 catch (Exception ex) { AppendLog("打开目录失败: " + ex.Message); }
             }
-            else
-            {
-                AppendLog("找不到该软件的安装目录: " + app.Name);
-            }
+            else AppendLog("找不到该软件的安装目录: " + app.Name);
         }
 
         private void UninstallSelected()
@@ -472,10 +605,7 @@ namespace SoftwareAssistant
                 return;
             }
 
-            try
-            {
-                Process.Start(new ProcessStartInfo("cmd.exe", "/c " + app.Uninstall) { UseShellExecute = true });
-            }
+            try { Process.Start(new ProcessStartInfo("cmd.exe", "/c " + app.Uninstall) { UseShellExecute = true }); }
             catch (Exception ex) { AppendLog("卸载启动失败: " + ex.Message); }
         }
 
@@ -506,7 +636,6 @@ namespace SoftwareAssistant
 
                         object sysComp = sub.GetValue("SystemComponent");
                         if (sysComp != null && Convert.ToInt32(sysComp) == 1) continue;
-
                         if (displayName.StartsWith("Update for", StringComparison.OrdinalIgnoreCase)) continue;
                         if (displayName.StartsWith("KB", StringComparison.OrdinalIgnoreCase)) continue;
 
@@ -517,8 +646,6 @@ namespace SoftwareAssistant
                             uninstall = sub.GetValue("UninstallString") as string ?? "";
                         string location = sub.GetValue("InstallLocation") as string ?? "";
 
-                        string exePath = ExtractExePath(displayIcon);
-
                         string key = displayName + "|" + version;
                         if (!seen.Add(key)) continue;
 
@@ -526,7 +653,7 @@ namespace SoftwareAssistant
                         {
                             Name = displayName.Trim(),
                             Version = version,
-                            ExePath = exePath,
+                            ExePath = ExtractExePath(displayIcon),
                             Uninstall = uninstall,
                             Location = location
                         });
@@ -544,7 +671,6 @@ namespace SoftwareAssistant
             if (string.IsNullOrWhiteSpace(displayIcon)) return null;
 
             string p = displayIcon.Trim().Trim('"');
-
             int comma = p.LastIndexOf(',');
             if (comma > 2) p = p.Substring(0, comma).Trim().Trim('"');
 
@@ -560,22 +686,310 @@ namespace SoftwareAssistant
             return null;
         }
 
-        // ================= 主流程 =================
+        // ================= 检查匹配 → 确认 → 执行 =================
+
+        private void PreviewButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (!IsAdministrator()) return;
+
+            var terms = ParseInput();
+            if (terms.Count == 0) return;
+
+            SuggestionPopup.IsOpen = false;
+            PreviewButton.IsEnabled = false;
+            StartButton.IsEnabled = false;
+            LogTextBox.Text = "正在解析匹配…\r\n";
+
+            Task.Run(() =>
+            {
+                var plan = new List<PlanItem>();
+                for (int i = 0; i < terms.Count; i++)
+                {
+                    string t = terms[i];
+                    SetProgress(i * 100.0 / terms.Count, "解析: " + t);
+                    AppendLog("");
+                    AppendLog(string.Format("解析 ({0}/{1}): {2}", i + 1, terms.Count, t));
+                    plan.Add(ResolvePlanItem(t));
+                }
+
+                Dispatcher.Invoke(delegate
+                {
+                    PreviewButton.IsEnabled = true;
+                    StartButton.IsEnabled = true;
+                    SetProgress(0, "解析完成，等待确认");
+                    ShowPlanDialog(plan);
+                });
+            });
+        }
+
+        private PlanItem ResolvePlanItem(string term)
+        {
+            if (IsUrl(term))
+                return new PlanItem { Term = term, Kind = PlanKind.Url };
+
+            var pick = ResolveTerm(term);
+            if (pick != null)
+                return new PlanItem { Term = term, Kind = PlanKind.Package, Pick = pick };
+
+            bool isDriver = LooksLikeDriver(term);
+
+            AppendLog(isDriver ? "    → 按驱动处理，查询厂商官方驱动页" : "    → 包管理器都没有，查询官方网站");
+
+            string siteName, url;
+            AskOfficialSite(term, isDriver, out siteName, out url);
+
+            var item = new PlanItem { Term = term, Kind = PlanKind.Link, SiteName = siteName, Url = url };
+
+            if (isDriver)
+            {
+                item.AlternateName = "微软更新目录（驱动库）";
+                item.AlternateUrl = "https://www.catalog.update.microsoft.com/Search.aspx?q=" + Uri.EscapeDataString(term);
+            }
+
+            if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(item.AlternateUrl))
+            {
+                item.Kind = PlanKind.None;
+                AppendLog("    ❌ 未能找到任何可用来源");
+            }
+            else
+            {
+                if (!string.IsNullOrEmpty(url)) AppendLog("    → 官网: " + url);
+                if (!string.IsNullOrEmpty(item.AlternateUrl)) AppendLog("    → 备用: " + item.AlternateName);
+            }
+
+            return item;
+        }
+
+        private static bool LooksLikeDriver(string term)
+        {
+            string k = term.ToLowerInvariant();
+            return k.Contains("驱动") || k.Contains("driver") || k.Contains("打印机") || k.Contains("printer");
+        }
+
+        private void ShowPlanDialog(List<PlanItem> plan)
+        {
+            var win = new Window
+            {
+                Title = "确认安装清单",
+                Width = 820,
+                Height = 560,
+                Owner = this,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                Background = MakeBrush("#1B1C20")
+            };
+
+            var root = new DockPanel { Margin = new Thickness(18) };
+
+            var header = new TextBlock
+            {
+                Text = "请核对每个输入对应的目标。确认无误后再点「确认并执行」。",
+                Foreground = MakeBrush("#9AA0A8"),
+                FontSize = 13,
+                Margin = new Thickness(0, 0, 0, 12)
+            };
+            DockPanel.SetDock(header, Dock.Top);
+            root.Children.Add(header);
+
+            var buttons = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 14, 0, 0)
+            };
+            DockPanel.SetDock(buttons, Dock.Bottom);
+
+            bool confirmed = false;
+
+            var ok = MakeDialogButton("确认并执行", "#4C8DFF", "#FFFFFF", 140);
+            var cancel = MakeDialogButton("取消", "#2E3138", "#D5D8DD", 90);
+            ok.Margin = new Thickness(0, 0, 10, 0);
+            ok.Click += delegate { confirmed = true; win.Close(); };
+            cancel.Click += delegate { win.Close(); };
+            buttons.Children.Add(ok);
+            buttons.Children.Add(cancel);
+            root.Children.Add(buttons);
+
+            var panel = new StackPanel();
+
+            foreach (var p in plan)
+            {
+                var row = new Grid { Margin = new Thickness(0, 7, 0, 7) };
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(180) });
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+                var left = new TextBlock
+                {
+                    Text = p.Term,
+                    Foreground = MakeBrush("#C8CDD4"),
+                    FontSize = 13,
+                    TextTrimming = TextTrimming.CharacterEllipsis,
+                    VerticalAlignment = VerticalAlignment.Top
+                };
+                Grid.SetColumn(left, 0);
+                row.Children.Add(left);
+
+                var right = new StackPanel();
+                Grid.SetColumn(right, 1);
+
+                if (p.Kind == PlanKind.Package)
+                {
+                    right.Children.Add(new TextBlock
+                    {
+                        Text = p.Pick.Name + "    " + p.Pick.Id,
+                        Foreground = MakeBrush("#E4E6EA"),
+                        FontSize = 13,
+                        TextWrapping = TextWrapping.Wrap
+                    });
+                    right.Children.Add(new TextBlock
+                    {
+                        Text = "来源: " + (string.IsNullOrEmpty(p.Pick.Source) ? "winget" : p.Pick.Source),
+                        Foreground = MakeBrush("#7C828C"),
+                        FontSize = 11,
+                        Margin = new Thickness(0, 2, 0, 0)
+                    });
+                }
+                else if (p.Kind == PlanKind.Url)
+                {
+                    right.Children.Add(new TextBlock { Text = "直链下载", Foreground = MakeBrush("#E4E6EA"), FontSize = 13 });
+                }
+                else if (p.Kind == PlanKind.None)
+                {
+                    right.Children.Add(new TextBlock { Text = "✗ 未找到可用来源", Foreground = MakeBrush("#FF6B6B"), FontSize = 13 });
+                }
+                else
+                {
+                    if (!string.IsNullOrEmpty(p.Url))
+                        right.Children.Add(MakeLink(p.SiteName + "  " + p.Url, p.Url));
+
+                    if (!string.IsNullOrEmpty(p.AlternateUrl))
+                    {
+                        var alt = MakeLink(p.AlternateName + "  " + p.AlternateUrl, p.AlternateUrl);
+                        alt.Margin = new Thickness(0, 4, 0, 0);
+                        right.Children.Add(alt);
+                    }
+                }
+
+                row.Children.Add(right);
+                panel.Children.Add(row);
+                panel.Children.Add(new Border { Height = 1, Background = MakeBrush("#2F3238") });
+            }
+
+            var scroll = new ScrollViewer
+            {
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                Content = panel
+            };
+            root.Children.Add(scroll);
+
+            win.Content = root;
+            win.ShowDialog();
+
+            if (confirmed) RunPlan(plan);
+        }
+
+        private static FrameworkElement MakeLink(string text, string url)
+        {
+            var tb = new TextBlock { FontSize = 12, TextWrapping = TextWrapping.Wrap };
+            var link = new Hyperlink(new Run(text)) { Foreground = MakeBrush("#4C8DFF") };
+            Uri uri;
+            if (Uri.TryCreate(url, UriKind.Absolute, out uri)) link.NavigateUri = uri;
+            link.RequestNavigate += delegate (object s, RequestNavigateEventArgs e)
+            {
+                try { Process.Start(new ProcessStartInfo(e.Uri.AbsoluteUri) { UseShellExecute = true }); }
+                catch { }
+                e.Handled = true;
+            };
+            tb.Inlines.Add(link);
+            return tb;
+        }
+
+        private static Button MakeDialogButton(string text, string bg, string fg, double width)
+        {
+            var b = new Button
+            {
+                Content = text,
+                Width = width,
+                Height = 34,
+                Background = MakeBrush(bg),
+                Foreground = MakeBrush(fg),
+                BorderThickness = new Thickness(0)
+            };
+            return b;
+        }
+
+        private static readonly Dictionary<string, Brush> _brushCache = new Dictionary<string, Brush>();
+
+        private static Brush MakeBrush(string hex)
+        {
+            if (_brushCache.ContainsKey(hex)) return _brushCache[hex];
+            var b = (Brush)new BrushConverter().ConvertFromString(hex);
+            b.Freeze();
+            _brushCache[hex] = b;
+            return b;
+        }
+
+        private void RunPlan(List<PlanItem> plan)
+        {
+            StartButton.IsEnabled = false;
+            PreviewButton.IsEnabled = false;
+
+            AppendLog("\r\n开始执行 " + plan.Count + " 项…");
+
+            Task.Run(() =>
+            {
+                int ok = 0, fail = 0;
+                for (int i = 0; i < plan.Count; i++)
+                {
+                    var p = plan[i];
+                    SetProgress(i * 100.0 / plan.Count, string.Format("({0}/{1}) {2}", i + 1, plan.Count, p.Term));
+                    AppendLog("\r\n========================================");
+                    AppendLog(string.Format("[{0}/{1}] {2}", i + 1, plan.Count, p.Term));
+
+                    bool done = false;
+                    if (p.Kind == PlanKind.Url) done = InstallFromUrl(p.Term);
+                    else if (p.Kind == PlanKind.Package) done = InstallCandidate(p.Pick);
+                    else if (p.Kind == PlanKind.Link)
+                    {
+                        string target = !string.IsNullOrEmpty(p.Url) ? p.Url : p.AlternateUrl;
+                        try
+                        {
+                            Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+                            AppendLog("    → 已在浏览器中打开官方页面，请手动下载安装");
+                            done = true;
+                        }
+                        catch (Exception ex) { AppendLog("    ❌ 打开链接失败: " + ex.Message); }
+                    }
+
+                    if (done) ok++; else fail++;
+                    SetProgress((i + 1) * 100.0 / plan.Count, string.Format("已完成 {0}/{1}", i + 1, plan.Count));
+                }
+
+                AppendLog("\r\n========================================");
+                AppendLog(string.Format("全部完成！成功: {0} 个，失败/跳过: {1} 个。", ok, fail));
+                SetProgress(100, string.Format("完成 · 成功 {0} / 失败 {1}", ok, fail));
+                Dispatcher.Invoke(delegate { StartButton.IsEnabled = true; PreviewButton.IsEnabled = true; });
+            });
+        }
+
+        private List<string> ParseInput()
+        {
+            return InputTextBox.Text
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(x => x.Trim())
+                .Where(x => x.Length > 0 && !x.StartsWith("#"))
+                .ToList();
+        }
 
         private void StartButton_Click(object sender, RoutedEventArgs e)
         {
             if (!IsAdministrator()) return;
 
-            var list = InputTextBox.Text
-                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                .Select(x => x.Trim())
-                .Where(x => x.Length > 0 && !x.StartsWith("#"))
-                .ToList();
-
+            var list = ParseInput();
             if (list.Count == 0) return;
 
             SuggestionPopup.IsOpen = false;
             StartButton.IsEnabled = false;
+            PreviewButton.IsEnabled = false;
             LogTextBox.Text = "开始执行...\r\n";
             AppendLog(_llm == null
                 ? "提示: 未配置大模型，使用本地模糊匹配。配置路径: " + ActiveConfigPath
@@ -593,14 +1007,13 @@ namespace SoftwareAssistant
                     SetProgress(i * 100.0 / list.Count, string.Format("({0}/{1}) {2}", i + 1, list.Count, term));
 
                     if (InstallOne(term)) ok++; else fail++;
-
                     SetProgress((i + 1) * 100.0 / list.Count, string.Format("已完成 {0}/{1}", i + 1, list.Count));
                 }
 
                 AppendLog("\r\n========================================");
                 AppendLog(string.Format("全部完成！成功: {0} 个，失败/跳过: {1} 个。", ok, fail));
                 SetProgress(100, string.Format("完成 · 成功 {0} / 失败 {1}", ok, fail));
-                Dispatcher.Invoke(delegate { StartButton.IsEnabled = true; });
+                Dispatcher.Invoke(delegate { StartButton.IsEnabled = true; PreviewButton.IsEnabled = true; });
             });
         }
 
@@ -617,24 +1030,32 @@ namespace SoftwareAssistant
             AppendLog("  [3/3] Scoop");
             if (TryScoop(term)) return true;
 
-            AppendLog("  ❌ 三个包管理器都没能装上这条。");
-            AppendLog("     兜底：把安装包直链粘进来（http/https 的 .exe/.msi）");
+            bool isDriver = LooksLikeDriver(term);
+            string siteName, url;
+            AskOfficialSite(term, isDriver, out siteName, out url);
+            if (!string.IsNullOrEmpty(url))
+            {
+                try
+                {
+                    Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+                    AppendLog("  → 已打开官方页面: " + url);
+                    return true;
+                }
+                catch (Exception ex) { AppendLog("  打开链接失败: " + ex.Message); }
+            }
+
+            AppendLog("  ❌ 所有来源都未能安装这条。");
             return false;
         }
 
-        private bool TryWinget(string term)
+        // ================= 解析（不安装） =================
+
+        private Candidate ResolveTerm(string term)
         {
-            if (LooksLikeId(term))
+            if (LooksLikeId(term) && VerifyPackageId(term, out string idName))
             {
-                AppendLog("    → 按包 ID 精确安装");
-                SetIndeterminate("安装 " + term);
-                if (RunProcess("winget", "install --id \"" + term + "\" --exact --silent --accept-package-agreements --accept-source-agreements", out string idOut))
-                {
-                    AppendLog("    ✅ 成功");
-                    return true;
-                }
-                AppendLog("    ID 未命中，改为搜索");
-                AppendLastLines(idOut, 2);
+                AppendLog("    ✅ 精确命中: " + idName + " (" + term + ")");
+                return new Candidate { Name = idName, Id = term, Source = "ID" };
             }
 
             var queries = BuildQueries(term);
@@ -652,8 +1073,15 @@ namespace SoftwareAssistant
 
             if (all.Count == 0)
             {
+                AppendLog("    winget 搜索无结果，尝试推断包 ID");
+                var inferred = ResolvePackageId(term);
+                if (inferred != null) return inferred;
+            }
+
+            if (all.Count == 0)
+            {
                 AppendLog("    winget 无结果");
-                return false;
+                return null;
             }
 
             foreach (var c in all)
@@ -673,19 +1101,20 @@ namespace SoftwareAssistant
                 AppendLog(string.Format("        {0:0.00}  {1}  ({2}){3}", c.MatchScore, c.Name, c.Id,
                     string.IsNullOrEmpty(c.Source) ? "" : "  [" + c.Source + "]"));
 
-            Candidate pick;
             int aiIdx = AskBestIndex(term, ordered);
             if (aiIdx >= 0)
             {
-                pick = ordered[aiIdx];
-                AppendLog(string.Format("    → 大模型判定为第 {0} 个: {1} ({2})", aiIdx + 1, pick.Name, pick.Id));
-            }
-            else
-            {
-                pick = ordered[0];
-                AppendLog(string.Format("    → 本地匹配选择: {0} ({1})  匹配度 {2:0.00}", pick.Name, pick.Id, pick.MatchScore));
+                var aiPick = ordered[aiIdx];
+                AppendLog(string.Format("    → 大模型判定为第 {0} 个: {1} ({2})", aiIdx + 1, aiPick.Name, aiPick.Id));
+                return aiPick;
             }
 
+            AppendLog(string.Format("    → 本地匹配: {0} ({1})  匹配度 {2:0.00}", ordered[0].Name, ordered[0].Id, ordered[0].MatchScore));
+            return ordered[0];
+        }
+
+        private bool InstallCandidate(Candidate pick)
+        {
             SetIndeterminate("安装 " + pick.Id);
             if (RunProcess("winget", "install --id \"" + pick.Id + "\" --exact --silent --accept-package-agreements --accept-source-agreements", out string installOut))
             {
@@ -696,6 +1125,13 @@ namespace SoftwareAssistant
             AppendLog("    winget 安装失败：");
             AppendLastLines(installOut, 6);
             return false;
+        }
+
+        private bool TryWinget(string term)
+        {
+            var pick = ResolveTerm(term);
+            if (pick == null) return false;
+            return InstallCandidate(pick);
         }
 
         private List<Candidate> SearchAll(List<string> queries, bool quiet)
@@ -714,9 +1150,7 @@ namespace SoftwareAssistant
                 RunProcess("winget", "search \"" + q + "\" --accept-source-agreements", out string so);
 
                 foreach (var c in ParseWinget(so))
-                {
                     if (seen.Add(c.Id + "|" + c.Name)) all.Add(c);
-                }
             }
             return all;
         }
@@ -739,11 +1173,7 @@ namespace SoftwareAssistant
                         || (k.Length >= 2 && k.Contains(kk))
                         || (kk.Length >= 2 && kk.Contains(k));
 
-                if (hit && kk.Length > bestLen)
-                {
-                    bestLen = kk.Length;
-                    bestKey = kv.Key;
-                }
+                if (hit && kk.Length > bestLen) { bestLen = kk.Length; bestKey = kv.Key; }
             }
 
             if (bestKey != null) qs.AddRange(Knowledge[bestKey]);
@@ -858,13 +1288,13 @@ namespace SoftwareAssistant
             return s.Contains(".") && Regex.IsMatch(s, @"^[A-Za-z0-9][A-Za-z0-9_\-\.]*$");
         }
 
-        // ================= Chocolatey =================
+        // ================= Chocolatey / Scoop =================
 
         private bool TryChoco(string term)
         {
             if (!HasCommand("choco"))
             {
-                AppendLog("    未检测到 Chocolatey，跳过（安装见 https://chocolatey.org/install）");
+                AppendLog("    未检测到 Chocolatey，跳过（https://chocolatey.org/install）");
                 return false;
             }
 
@@ -875,25 +1305,18 @@ namespace SoftwareAssistant
                 return false;
             }
 
-            AppendLog("    搜索 Chocolatey 包库");
             SetIndeterminate("Chocolatey 搜索 " + key);
             if (!RunProcess("choco", "search " + key + " --limit-output --exact", out string s))
                 RunProcess("choco", "search " + key + " --limit-output", out s);
 
             var names = ParseChoco(s);
-            if (names.Count == 0)
-            {
-                AppendLog("    Chocolatey 无结果");
-                return false;
-            }
+            if (names.Count == 0) { AppendLog("    Chocolatey 无结果"); return false; }
 
             string pick = names.FirstOrDefault(n => string.Equals(n, key, StringComparison.OrdinalIgnoreCase)) ?? names[0];
-            AppendLog("    → 选择: " + pick);
-
             SetIndeterminate("Chocolatey 安装 " + pick);
             if (RunProcess("choco", "install " + pick + " -y --no-progress --limit-output", out string o))
             {
-                AppendLog("    ✅ 成功");
+                AppendLog("    ✅ 成功: " + pick);
                 return true;
             }
 
@@ -919,13 +1342,11 @@ namespace SoftwareAssistant
             return list;
         }
 
-        // ================= Scoop =================
-
         private bool TryScoop(string term)
         {
             if (!HasCommand("scoop"))
             {
-                AppendLog("    未检测到 Scoop，跳过（安装见 https://scoop.sh）");
+                AppendLog("    未检测到 Scoop，跳过（https://scoop.sh）");
                 return false;
             }
 
@@ -936,7 +1357,6 @@ namespace SoftwareAssistant
                 return false;
             }
 
-            AppendLog("    尝试 scoop install " + key);
             SetIndeterminate("Scoop 安装 " + key);
             if (RunProcess("scoop", "install " + key, out string o))
             {
@@ -971,13 +1391,13 @@ namespace SoftwareAssistant
                     wc.Headers.Add("User-Agent", "Mozilla/5.0");
                     var tcs = new TaskCompletionSource<bool>();
 
-                    wc.DownloadProgressChanged += delegate(object s, DownloadProgressChangedEventArgs ev)
+                    wc.DownloadProgressChanged += delegate (object s, DownloadProgressChangedEventArgs ev)
                     {
                         SetProgress(ev.ProgressPercentage, string.Format("下载中 {0}%  ({1:0.0} MB / {2:0.0} MB)",
                             ev.ProgressPercentage, ev.BytesReceived / 1048576.0, ev.TotalBytesToReceive / 1048576.0));
                     };
 
-                    wc.DownloadFileCompleted += delegate(object s, System.ComponentModel.AsyncCompletedEventArgs ev)
+                    wc.DownloadFileCompleted += delegate (object s, System.ComponentModel.AsyncCompletedEventArgs ev)
                     {
                         if (ev.Error != null) tcs.TrySetException(ev.Error);
                         else if (ev.Cancelled) tcs.TrySetCanceled();
@@ -995,7 +1415,7 @@ namespace SoftwareAssistant
                 else
                     Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
 
-                AppendLog("  ✅ 安装程序已启动，请按提示完成");
+                AppendLog("  ✅ 安装程序已启动");
                 return true;
             }
             catch (Exception ex)
@@ -1005,7 +1425,7 @@ namespace SoftwareAssistant
             }
         }
 
-        // ================= 进度条 =================
+        // ================= 进度 =================
 
         private void SetProgress(double percent, string status)
         {
@@ -1034,15 +1454,12 @@ namespace SoftwareAssistant
             public IntPtr hIcon;
             public int iIcon;
             public uint dwAttributes;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
-            public string szDisplayName;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)]
-            public string szTypeName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szDisplayName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)] public string szTypeName;
         }
 
         private const uint SHGFI_ICON = 0x000000100;
         private const uint SHGFI_SMALLICON = 0x000000001;
-        private const uint SHGFI_USEFILEATTRIBUTES = 0x000000010;
 
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         private static extern IntPtr SHGetFileInfo(string pszPath, uint dwFileAttributes,
