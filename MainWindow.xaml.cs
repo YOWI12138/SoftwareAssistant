@@ -490,8 +490,10 @@ namespace SoftwareAssistant
             catch { return null; }
         }
 
-        private static string AskLlm(LlmConfig cfg, string systemPrompt, string userPrompt)
+        private string AskLlm(LlmConfig cfg, string systemPrompt, string userPrompt)
         {
+            if (_stopRequested) return "";
+
             var payload = new
             {
                 model = cfg.Model,
@@ -1712,6 +1714,7 @@ namespace SoftwareAssistant
 
             foreach (var q in queries)
             {
+                if (_stopRequested) break;
                 AppendLog("    → 搜索: " + q);
                 SetIndeterminate("搜索: " + q);
                 RunProcess("winget", "search \"" + q + "\" --accept-source-agreements", out string so);
@@ -2205,6 +2208,7 @@ namespace SoftwareAssistant
 
         private void StopButton_Click(object sender, RoutedEventArgs e)
         {
+            if (_stopRequested) return;
             _stopRequested = true;
             AppendLog("⏹ 正在强制中止…");
 
@@ -2221,8 +2225,7 @@ namespace SoftwareAssistant
                 if (pr != null && !pr.HasExited)
                 {
                     AppendLog("   正在结束进程: " + pr.ProcessName + " (PID " + pr.Id + ")");
-                    Process.Start(new ProcessStartInfo("taskkill",
-                        "/PID " + pr.Id + " /T /F")
+                    Process.Start(new ProcessStartInfo("taskkill", "/PID " + pr.Id + " /T /F")
                     {
                         UseShellExecute = false,
                         CreateNoWindow = true
@@ -2232,6 +2235,11 @@ namespace SoftwareAssistant
             catch (Exception ex) { AppendLog("   结束进程失败: " + ex.Message); }
 
             EndProgress();
+            StartButton.IsEnabled = true;
+            PreviewButton.IsEnabled = true;
+            Progress.IsIndeterminate = false;
+            Progress.Value = 0;
+            StatusText.Text = "已中止";
             AppendLog("⏹ 已中止：后续项目不再执行");
         }
 
