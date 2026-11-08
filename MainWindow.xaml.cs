@@ -651,47 +651,85 @@ namespace SoftwareAssistant
 
         private List<WebHit> SearchWeb(string term)
         {
-            var hits = new List<WebHit>();
-            if (_stopRequested) return hits;
+            if (_stopRequested) return new List<WebHit>();
 
-            string html = null;
-            try
+            string q = Uri.EscapeDataString(term + " 官网 下载");
+
+            string[] engines =
             {
-                string q = Uri.EscapeDataString(term + " 官网 下载");
-                html = HttpGetText("https://www.bing.com/search?q=" + q + "&setlang=zh-CN");
+                "https://www.bing.com/search?q=" + q + "&setlang=zh-CN",
+                "https://cn.bing.com/search?q=" + q,
+                "https://www.sogou.com/web?query=" + q,
+                "https://html.duckduckgo.com/html/?q=" + q,
+                "https://www.so.com/s?q=" + q
+            };
+
+            foreach (var engine in engines)
+            {
+                if (_stopRequested) break;
+
+                string html = HttpGetText(engine);
+                if (string.IsNullOrEmpty(html)) continue;
+
+                var hits = ParseHits(html);
+                if (hits.Count == 0) continue;
+
+                AppendLog("    → 网页检索成功（来源 " + HostOf(engine) + "，共 " + hits.Count + " 条）");
+                ConfirmBestLink(term, hits);
+                return hits;
             }
-            catch { return hits; }
 
-            if (string.IsNullOrEmpty(html)) return hits;
+            AppendLog("    → 各搜索源均未取到结果，已提供搜索链接兜底");
+            return new List<WebHit>();
+        }
 
-            var rx = new Regex(@"<h2>\s*<a[^>]*href=""(?<u>https?://[^""]+)""[^>]*>(?<t>.*?)</a>",
-                               RegexOptions.Singleline | RegexOptions.IgnoreCase);
+        private static string HostOf(string url)
+        {
+            try { return new Uri(url).Host; } catch { return url; }
+        }
 
+        private static List<WebHit> ParseHits(string html)
+        {
+            var hits = new List<WebHit>();
             var seenHost = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            foreach (Match m in rx.Matches(html))
+            string[] patterns =
             {
-                string u = m.Groups["u"].Value;
-                string title = Regex.Replace(m.Groups["t"].Value, "<.*?>", "").Trim();
-                if (string.IsNullOrEmpty(u) || u.Length > 300) continue;
+                @"<h2>\s*<a[^>]*href=""(?<u>https?://[^""]+)""[^>]*>(?<t>.*?)</a>",
+                @"<a[^>]*class=""[^""]*result__a[^""]*""[^>]*href=""(?<u>https?://[^""]+)""[^>]*>(?<t>.*?)</a>",
+                @"<h3[^>]*>\s*<a[^>]*href=""(?<u>https?://[^""]+)""[^>]*>(?<t>.*?)</a>"
+            };
 
-                string host;
-                try { host = new Uri(u).Host; } catch { continue; }
+            foreach (var pat in patterns)
+            {
+                var rx = new Regex(pat, RegexOptions.Singleline | RegexOptions.IgnoreCase);
 
-                if (BlockedHosts.Any(b => host.EndsWith(b, StringComparison.OrdinalIgnoreCase))) continue;
-                if (!seenHost.Add(host)) continue;
-
-                hits.Add(new WebHit
+                foreach (Match m in rx.Matches(html))
                 {
-                    Title = DecodeHtml(title),
-                    Url = u,
-                    Host = host
-                });
+                    string u = m.Groups["u"].Value;
+                    if (string.IsNullOrEmpty(u) || u.Length > 300) continue;
 
-                if (hits.Count >= 8) break;
+                    string host;
+                    try { host = new Uri(u).Host; } catch { continue; }
+
+                    if (BlockedHosts.Any(b => host.EndsWith(b, StringComparison.OrdinalIgnoreCase))) continue;
+                    if (!seenHost.Add(host)) continue;
+
+                    string title = Regex.Replace(m.Groups["t"].Value, "<.*?>", "").Trim();
+
+                    hits.Add(new WebHit
+                    {
+                        Title = DecodeHtml(title),
+                        Url = u,
+                        Host = host
+                    });
+
+                    if (hits.Count >= 8) break;
+                }
+
+                if (hits.Count > 0) break;
             }
 
-            if (hits.Count > 0) ConfirmBestLink(term, hits);
             return hits;
         }
 
@@ -1934,7 +1972,7 @@ namespace SoftwareAssistant
                     sp.Children.Add(lk);
                 }
 
-                if (r.Hits != null)
+                if (r.Hits != null && r.Hits.Count > 0)
                 {
                     foreach (var h in r.Hits.Take(3))
                     {
@@ -1942,6 +1980,18 @@ namespace SoftwareAssistant
                         lk.Margin = new Thickness(0, 3, 0, 0);
                         sp.Children.Add(lk);
                     }
+                }
+                else if (r.Status != "检索中")
+                {
+                    var bing = MakeLink("🔍 必应搜索「" + r.Term + "」",
+                        "https://www.bing.com/search?q=" + Uri.EscapeDataString(r.Term));
+                    bing.Margin = new Thickness(0, 3, 0, 0);
+                    sp.Children.Add(bing);
+
+                    var baidu = MakeLink("🔍 百度搜索「" + r.Term + "」",
+                        "https://www.baidu.com/s?wd=" + Uri.EscapeDataString(r.Term));
+                    baidu.Margin = new Thickness(0, 3, 0, 0);
+                    sp.Children.Add(baidu);
                 }
 
                 card.Child = sp;
