@@ -1213,18 +1213,22 @@ namespace SoftwareAssistant
                     AppendLog("");
                     AppendLog(string.Format("解析 ({0}/{1}): {2}", i + 1, terms.Count, t));
 
-                    var item = StartWebSearch(t, "检索中");
                     var p = ResolvePlanItem(t);
                     plan.Add(p);
 
+                    ItemResult item;
                     if (p.Kind == PlanKind.Package && p.Pick != null)
                     {
-                        item.PackageId = p.Pick.Id;
-                        item.PackageName = p.Pick.Name;
+                        item = new ItemResult { Term = t, Status = "已解析", PackageId = p.Pick.Id, PackageName = p.Pick.Name };
+                        lock (_results) _results.Add(item);
+                        AppendLog("    ✔ 已确定安装包，跳过网页检索");
+                        Dispatcher.Invoke(delegate { RebuildWebPanel(); });
                     }
-                    else if (p.Kind == PlanKind.None)
+                    else
                     {
-                        item.Status = "无来源";
+                        AppendLog("    → 未确定安装包，开始网页检索");
+                        item = StartWebSearch(t, "检索中");
+                        if (p.Kind == PlanKind.None) item.Status = "无来源";
                     }
 
                     Dispatcher.Invoke(delegate { RebuildWebPanel(); });
@@ -1448,7 +1452,17 @@ namespace SoftwareAssistant
                     _itemIndex = i;
                     _itemStart = DateTime.Now;
 
-                    var item = StartWebSearch(p.Term, "执行中");
+                    ItemResult item;
+                    if (p.Kind == PlanKind.Package && p.Pick != null)
+                    {
+                        item = new ItemResult { Term = p.Term, Status = "执行中", PackageId = p.Pick.Id, PackageName = p.Pick.Name };
+                        lock (_results) _results.Add(item);
+                        Dispatcher.Invoke(delegate { RebuildWebPanel(); });
+                    }
+                    else
+                    {
+                        item = StartWebSearch(p.Term, "执行中");
+                    }
 
                     bool done = false;
                     if (p.Kind == PlanKind.Url) done = InstallFromUrl(p.Term);
@@ -1636,15 +1650,21 @@ namespace SoftwareAssistant
 
         private Candidate ResolveTerm(string term)
         {
+            AppendLog("    [1] 本地名录检索");
             var local = SearchCatalog(term, 5);
             if (local.Count > 0)
             {
                 var best = local[0];
                 if (RankEntry(best, Normalize(term)) >= 86)
                 {
-                    AppendLog("    ✅ 名录命中: " + best.Name + " (" + best.Id + ")");
+                    AppendLog("    ✅ 名录命中: " + best.Name + " (" + best.Id + ") —— 中断联网检索");
                     return new Candidate { Name = best.Name, Id = best.Id, Source = "本地名录" };
                 }
+                AppendLog("    ≈ 名录仅有相近项: " + best.Name + "，不算命中");
+            }
+            else
+            {
+                AppendLog("    ✗ 本地名录无匹配");
             }
 
             if (LooksLikeId(term) && VerifyPackageId(term, out string idName))
@@ -2005,17 +2025,21 @@ namespace SoftwareAssistant
                         sp.Children.Add(lk);
                     }
                 }
-                else if (r.Status != "检索中")
+
+                if (r.Status != "检索中")
                 {
                     var bing = MakeLink("🔍 必应搜索「" + r.Term + "」",
                         "https://www.bing.com/search?q=" + Uri.EscapeDataString(r.Term));
                     bing.Margin = new Thickness(0, 3, 0, 0);
                     sp.Children.Add(bing);
 
-                    var baidu = MakeLink("🔍 百度搜索「" + r.Term + "」",
-                        "https://www.baidu.com/s?wd=" + Uri.EscapeDataString(r.Term));
-                    baidu.Margin = new Thickness(0, 3, 0, 0);
-                    sp.Children.Add(baidu);
+                    if (r.Hits == null || r.Hits.Count == 0)
+                    {
+                        var baidu = MakeLink("🔍 百度搜索「" + r.Term + "」",
+                            "https://www.baidu.com/s?wd=" + Uri.EscapeDataString(r.Term));
+                        baidu.Margin = new Thickness(0, 3, 0, 0);
+                        sp.Children.Add(baidu);
+                    }
                 }
 
                 card.Child = sp;
