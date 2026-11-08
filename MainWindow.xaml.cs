@@ -795,12 +795,18 @@ namespace SoftwareAssistant
             foreach (var g in AskPackageIds(term))
             {
                 AppendLog("    → 校验包 ID: " + g);
-                if (VerifyPackageId(g, out string displayName))
+                if (!VerifyPackageId(g, out string displayName)) continue;
+
+                double sim = Math.Max(Score(term, displayName), Score(term, g));
+                if (sim < 0.30)
                 {
-                    cache[term] = g;
-                    SaveAliasCache(cache);
-                    return new Candidate { Name = displayName, Id = g, Source = "AI 推断" };
+                    AppendLog("    ⚠ 名称差异过大，已丢弃: " + g + " (" + displayName + ")");
+                    continue;
                 }
+
+                cache[term] = g;
+                SaveAliasCache(cache);
+                return new Candidate { Name = displayName, Id = g, Source = "AI 推断" };
             }
             return null;
         }
@@ -1337,6 +1343,16 @@ namespace SoftwareAssistant
                 else if (p.Kind == PlanKind.None)
                 {
                     right.Children.Add(new TextBlock { Text = "✗ 未找到可用来源", Foreground = MakeBrush("#FF6B6B"), FontSize = 13 });
+
+                    var bing = MakeLink("🔍 必应搜索「" + p.Term + "」",
+                        "https://www.bing.com/search?q=" + Uri.EscapeDataString(p.Term));
+                    bing.Margin = new Thickness(0, 4, 0, 0);
+                    right.Children.Add(bing);
+
+                    var baidu = MakeLink("🔍 百度搜索「" + p.Term + "」",
+                        "https://www.baidu.com/s?wd=" + Uri.EscapeDataString(p.Term));
+                    baidu.Margin = new Thickness(0, 4, 0, 0);
+                    right.Children.Add(baidu);
                 }
                 else
                 {
