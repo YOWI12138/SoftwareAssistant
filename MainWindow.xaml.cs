@@ -143,6 +143,8 @@ namespace SoftwareAssistant
         private List<CatalogEntry> _catalog = new List<CatalogEntry>();
         private readonly List<ItemResult> _results = new List<ItemResult>();
         private volatile bool _stopRequested;
+        private volatile Process _currentProc;
+        private volatile WebClient _currentWebClient;
 
         private DateTime _itemStart = DateTime.Now;
         private int _itemIndex;
@@ -1374,6 +1376,11 @@ namespace SoftwareAssistant
                         alt.Margin = new Thickness(0, 4, 0, 0);
                         right.Children.Add(alt);
                     }
+
+                    var bing = MakeLink("🔍 必应搜索「" + p.Term + "」",
+                        "https://www.bing.com/search?q=" + Uri.EscapeDataString(p.Term));
+                    bing.Margin = new Thickness(0, 6, 0, 0);
+                    right.Children.Add(bing);
                 }
 
                 row.Children.Add(right);
@@ -1885,6 +1892,7 @@ namespace SoftwareAssistant
 
                 using (var wc = new WebClient())
                 {
+                    _currentWebClient = wc;
                     wc.Headers.Add("User-Agent", "Mozilla/5.0");
                     var tcs = new TaskCompletionSource<bool>();
 
@@ -2103,6 +2111,7 @@ namespace SoftwareAssistant
 
                 using (var p = Process.Start(psi))
                 {
+                    _currentProc = p;
                     string stdout = "";
                     string stderr = "";
                     var t1 = Task.Run(delegate { stdout = p.StandardOutput.ReadToEnd(); });
@@ -2110,11 +2119,13 @@ namespace SoftwareAssistant
                     p.WaitForExit();
                     Task.WaitAll(t1, t2);
                     output = (stdout + "\r\n" + stderr).Trim();
+                    _currentProc = null;
                     return p.ExitCode == 0;
                 }
             }
             catch (Exception ex)
             {
+                _currentProc = null;
                 output = ex.Message;
                 return false;
             }
@@ -2171,7 +2182,33 @@ namespace SoftwareAssistant
         private void StopButton_Click(object sender, RoutedEventArgs e)
         {
             _stopRequested = true;
-            AppendLog("⏹ 已请求停止：当前这一项处理完就会中止");
+            AppendLog("⏹ 正在强制中止…");
+
+            try
+            {
+                var wc = _currentWebClient;
+                if (wc != null) wc.CancelAsync();
+            }
+            catch { }
+
+            try
+            {
+                var pr = _currentProc;
+                if (pr != null && !pr.HasExited)
+                {
+                    AppendLog("   正在结束进程: " + pr.ProcessName + " (PID " + pr.Id + ")");
+                    Process.Start(new ProcessStartInfo("taskkill",
+                        "/PID " + pr.Id + " /T /F")
+                    {
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    });
+                }
+            }
+            catch (Exception ex) { AppendLog("   结束进程失败: " + ex.Message); }
+
+            EndProgress();
+            AppendLog("⏹ 已中止：后续项目不再执行");
         }
 
         private void ClearButton_Click(object sender, RoutedEventArgs e)
