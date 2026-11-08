@@ -1,7 +1,7 @@
 <Window x:Class="SoftwareAssistant.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="智能软件安装助手" Height="760" Width="1140"
+        Title="智能软件安装助手" Height="800" Width="1160"
         WindowStartupLocation="CenterScreen"
         Background="#1B1C20"
         FontFamily="Microsoft YaHei UI, Segoe UI">
@@ -9,7 +9,6 @@
     <Window.Resources>
         <SolidColorBrush x:Key="CardBg" Color="#24262B"/>
         <SolidColorBrush x:Key="CardBg2" Color="#1F2126"/>
-        <SolidColorBrush x:Key="Line" Color="#2F3238"/>
         <SolidColorBrush x:Key="TextMain" Color="#E4E6EA"/>
         <SolidColorBrush x:Key="TextSub" Color="#9AA0A8"/>
         <SolidColorBrush x:Key="Accent" Color="#4C8DFF"/>
@@ -74,7 +73,9 @@
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
-                <RowDefinition Height="140"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="130"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
@@ -82,23 +83,34 @@
 
             <StackPanel Grid.Row="0" Margin="0,0,0,14">
                 <TextBlock Text="智能软件安装助手" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource TextMain}"/>
-                <TextBlock Text="winget / msstore · Chocolatey · Scoop · 直链 · 驱动官网"
+                <TextBlock Text="本地名录 · winget / msstore · Chocolatey · Scoop · 直链 · 驱动官网"
                            FontSize="12" Foreground="{StaticResource TextSub}" Margin="0,5,0,0"/>
             </StackPanel>
 
-            <TextBlock Grid.Row="1" Text="要安装的软件（每行一个，输入时有候选提示）"
+            <!-- 搜索框 -->
+            <TextBlock Grid.Row="1" x:Name="CatalogHint"
+                       Text="搜索软件（支持中文、英文、拼音首字母），点选后加入下方列表"
                        FontSize="12" Foreground="{StaticResource TextSub}" Margin="2,0,0,7"/>
 
-            <Border Grid.Row="2" Style="{StaticResource Card}" Padding="4">
+            <Border Grid.Row="2" Style="{StaticResource Card}" Padding="4" Margin="0,0,0,14">
+                <TextBox x:Name="SearchBox" Style="{StaticResource FlatTextBox}" FontSize="14"
+                         TextChanged="SearchBox_TextChanged"
+                         PreviewKeyDown="SearchBox_PreviewKeyDown"/>
+            </Border>
+
+            <TextBlock Grid.Row="3" Text="待安装列表（每行一个）"
+                       FontSize="12" Foreground="{StaticResource TextSub}" Margin="2,0,0,7"/>
+
+            <Border Grid.Row="4" Style="{StaticResource Card}" Padding="4">
                 <TextBox x:Name="InputTextBox" Style="{StaticResource FlatTextBox}"
                          AcceptsReturn="True" TextWrapping="NoWrap"
                          VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
                          FontFamily="Consolas"
                          TextChanged="InputTextBox_TextChanged"
-                         Text="微信&#x0a;向日葵&#x0a;HP LaserJet M404&#x0a;Google Chrome"/>
+                         Text="微信&#x0a;千牛&#x0a;Google Chrome"/>
             </Border>
 
-            <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,14,0,0">
+            <StackPanel Grid.Row="5" Orientation="Horizontal" Margin="0,14,0,0">
                 <Button x:Name="PreviewButton" Content="① 检查匹配并确认" Width="180"
                         Style="{StaticResource PrimaryButton}" Click="PreviewButton_Click"/>
                 <Button x:Name="StartButton" Content="直接安装" Width="110" Margin="10,0,0,0"
@@ -109,19 +121,19 @@
                         Style="{StaticResource GhostButton}" Click="ClearButton_Click"/>
             </StackPanel>
 
-            <StackPanel Grid.Row="4" Margin="2,14,0,0">
+            <StackPanel Grid.Row="6" Margin="2,14,0,0">
                 <TextBlock x:Name="StatusText" Text="就绪" FontSize="12" Foreground="{StaticResource TextSub}"/>
                 <ProgressBar x:Name="Progress" Height="6" Margin="0,7,0,0"
                              Minimum="0" Maximum="100" Value="0"
                              Foreground="{StaticResource Accent}" Background="#2E3138" BorderThickness="0"/>
             </StackPanel>
 
-            <Border Grid.Row="5" Style="{StaticResource Card}" Padding="4" Margin="0,14,0,0">
+            <Border Grid.Row="7" Style="{StaticResource Card}" Padding="4" Margin="0,14,0,0">
                 <TextBox x:Name="LogTextBox" Style="{StaticResource FlatTextBox}"
                          IsReadOnly="True" FontFamily="Consolas" FontSize="12"
                          Background="#17181C" Foreground="#C8CDD4"
                          VerticalScrollBarVisibility="Auto"
-                         Text="准备就绪，点击「检查匹配并确认」可先核对再安装..."/>
+                         Text="准备就绪。可先用上方搜索框挑软件，再点「检查匹配并确认」。"/>
             </Border>
         </Grid>
 
@@ -182,8 +194,8 @@
             </DockPanel>
         </Border>
 
-        <!-- ============ 自动补全弹层 ============ -->
-        <Popup x:Name="SuggestionPopup" PlacementTarget="{Binding ElementName=InputTextBox}"
+        <!-- ============ 搜索框弹层 ============ -->
+        <Popup x:Name="SearchPopup" PlacementTarget="{Binding ElementName=SearchBox}"
                Placement="Bottom" StaysOpen="False" AllowsTransparency="True"
                PopupAnimation="Fade" IsOpen="False">
             <Border Background="#2A2D33" CornerRadius="8" Margin="0,6,0,0" Padding="4"
@@ -191,13 +203,13 @@
                 <Border.Effect>
                     <DropShadowEffect Color="#66000000" BlurRadius="16" ShadowDepth="3" Direction="270"/>
                 </Border.Effect>
-                <ListBox x:Name="SuggestionList" BorderThickness="0" Background="Transparent" Width="420"
+                <ListBox x:Name="SearchList" BorderThickness="0" Background="Transparent" Width="460"
                          Foreground="#E4E6EA"
-                         MouseLeftButtonUp="SuggestionList_MouseLeftButtonUp"
-                         PreviewKeyDown="SuggestionList_PreviewKeyDown">
+                         MouseLeftButtonUp="SearchList_MouseLeftButtonUp"
+                         PreviewKeyDown="SearchList_PreviewKeyDown">
                     <ListBox.ItemTemplate>
                         <DataTemplate>
-                            <Grid Height="30">
+                            <Grid Height="34">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*"/>
                                     <ColumnDefinition Width="Auto"/>
@@ -206,7 +218,40 @@
                                            VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
                                 <Border Grid.Column="1" Background="#3A3E46" CornerRadius="4"
                                         Padding="6,2" Margin="10,0,0,0" VerticalAlignment="Center">
-                                    <TextBlock Text="{Binding Source}" FontSize="10" Foreground="#A9AFB8"/>
+                                    <TextBlock Text="{Binding Id}" FontSize="10" Foreground="#A9AFB8"/>
+                                </Border>
+                            </Grid>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </Border>
+        </Popup>
+
+        <!-- ============ 待安装列表自动补全弹层 ============ -->
+        <Popup x:Name="SuggestionPopup" PlacementTarget="{Binding ElementName=InputTextBox}"
+               Placement="Bottom" StaysOpen="False" AllowsTransparency="True"
+               PopupAnimation="Fade" IsOpen="False">
+            <Border Background="#2A2D33" CornerRadius="8" Margin="0,6,0,0" Padding="4"
+                    BorderBrush="#3A3E46" BorderThickness="1">
+                <Border.Effect>
+                    <DropShadowEffect Color="#66000000" BlurRadius="16" ShadowDepth="3" Direction="270"/>
+                </Border.Effect>
+                <ListBox x:Name="SuggestionList" BorderThickness="0" Background="Transparent" Width="460"
+                         Foreground="#E4E6EA"
+                         MouseLeftButtonUp="SuggestionList_MouseLeftButtonUp"
+                         PreviewKeyDown="SuggestionList_PreviewKeyDown">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <Grid Height="34">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="{Binding Name}" FontSize="13" Foreground="#E4E6EA"
+                                           VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                                <Border Grid.Column="1" Background="#3A3E46" CornerRadius="4"
+                                        Padding="6,2" Margin="10,0,0,0" VerticalAlignment="Center">
+                                    <TextBlock Text="{Binding Id}" FontSize="10" Foreground="#A9AFB8"/>
                                 </Border>
                             </Grid>
                         </DataTemplate>

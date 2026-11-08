@@ -32,6 +32,15 @@ namespace SoftwareAssistant
         public double MatchScore { get; set; }
     }
 
+    public class CatalogEntry
+    {
+        public string Id { get; set; }
+        public string Name { get; set; }
+        public string NameNorm { get; set; }
+        public string IdNorm { get; set; }
+        public string Init { get; set; }
+    }
+
     public class InstalledApp
     {
         public string Name { get; set; }
@@ -53,6 +62,7 @@ namespace SoftwareAssistant
         public Candidate Pick { get; set; }
         public string Url { get; set; }
         public string SiteName { get; set; }
+        public string SupportUrl { get; set; }
         public string AlternateUrl { get; set; }
         public string AlternateName { get; set; }
     }
@@ -75,25 +85,43 @@ namespace SoftwareAssistant
             { "迅雷",     new[] { "Thunder", "Xunlei" } },
             { "爱奇艺",   new[] { "iQIYI" } },
             { "优酷",     new[] { "Youku" } },
-            { "哔哩哔哩", new[] { "Bilibili" } },
             { "b站",      new[] { "Bilibili" } },
             { "抖音",     new[] { "Douyin", "TikTok" } },
             { "搜狗输入法", new[] { "Sogou Input" } },
-            { "火绒",     new[] { "Huorong" } },
             { "360",      new[] { "360 Total Security", "360Safe" } },
             { "谷歌浏览器", new[] { "Google Chrome" } },
             { "chrome",   new[] { "Google Chrome" } },
             { "vscode",   new[] { "Visual Studio Code" } },
             { "steam",    new[] { "Steam" } },
-            { "剪映",     new[] { "JianYing", "CapCut" } },
-            { "阿里云盘", new[] { "Aliyun Drive", "AliPan" } }
+            { "剪映",     new[] { "JianYing", "CapCut" } }
         };
+
+        private static readonly Dictionary<char, char> PyInit = BuildPyMap();
+
+        private static Dictionary<char, char> BuildPyMap()
+        {
+            var d = new Dictionary<char, char>();
+            const string pairs =
+                "微w信x腾t讯x企q业y钉d飞f书s会h议y网w易y音y乐l视s频p播b放f器q浏l览l谷g歌g火f狐h搜s狗g输s入r法f百b度d盘p里l巴b淘t宝b天t猫m京j东d拼p多d苏s宁n美m团t大d众z点d评p小x红h书s知z乎h抖d快k手s博b安a全q卫w士s管g家j驱q打d印y机j笔b记j本b电d脑n桌z面m文w档d图t下x载z压y缩s解j工g具j开k发f编b辑j代d码m邮y箱x聊l远y程c控k制z录l屏p截j转z换h格g式s游y戏x平p台t加j速s模m拟n杀s毒d优y化h清q理l测c翻f译y词c典d手s写x语y识s别b云y盘p同t步b备b份f恢h复f";
+
+            for (int i = 0; i + 1 < pairs.Length; i += 2)
+            {
+                char c = pairs[i];
+                char l = pairs[i + 1];
+                if (!d.ContainsKey(c)) d[c] = l;
+            }
+            return d;
+        }
 
         private LlmConfig _llm;
         private DispatcherTimer _suggestTimer;
+        private DispatcherTimer _searchTimer;
         private int _suggestSeq;
+        private int _searchSeq;
         private List<InstalledApp> _installed = new List<InstalledApp>();
         private readonly Dictionary<string, ImageSource> _iconCache = new Dictionary<string, ImageSource>(StringComparer.OrdinalIgnoreCase);
+        private List<CatalogEntry> _catalog = new List<CatalogEntry>();
+        private volatile bool _stopRequested;
 
         public MainWindow()
         {
@@ -105,9 +133,13 @@ namespace SoftwareAssistant
             }
 
             _llm = LoadConfig();
+            LoadCatalog();
 
-            _suggestTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(450) };
+            _suggestTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(220) };
             _suggestTimer.Tick += SuggestTimer_Tick;
+
+            _searchTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(160) };
+            _searchTimer.Tick += SearchTimer_Tick;
 
             var cm = new ContextMenu();
             var miStart = new MenuItem { Header = "启动" };
@@ -126,7 +158,281 @@ namespace SoftwareAssistant
             LoadInstalledAsync();
         }
 
-        // ================= 配置 =================
+        // ================= 本地名录 =================
+
+        private static IEnumerable<string> CatalogPaths()
+        {
+            yield return Path.Combine(AppContext.BaseDirectory, "winget_catalog.json");
+            yield return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                                      "SoftwareAssistant", "winget_catalog.json");
+            yield return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "winget_catalog.json");
+        }
+
+        private void LoadCatalog()
+        {
+            string found = null;
+            foreach (var p in CatalogPaths())
+            {
+                if (File.Exists(p)) { found = p; break; }
+            }
+
+            if (found == null)
+            {
+                CatalogHint.Text = "搜索软件（未找到本地名录，仅支持联网搜索）";
+                AppendLog("提示: 未找到 winget_catalog.json，本地搜索不可用");
+                return;
+            }
+
+            try
+            {
+                var raw = JsonSerializer.Deserialize<Dictionary<string, string>>(
+                    File.ReadAllText(found, Encoding.UTF8), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+                var list = new List<CatalogEntry>();
+                if (raw != null)
+                {
+                    foreach (var kv in raw)
+                    {
+                        string name = kv.Value ?? "";
+                        list.Add(new CatalogEntry
+                        {
+                            Id = kv.Key,
+                            Name = name,
+                            NameNorm = Normalize(name),
+                            IdNorm = Normalize(kv.Key),
+                            Init = Initials(name + " " + kv.Key)
+                        });
+                    }
+                }
+
+                _catalog = list;
+                CatalogHint.Text = string.Format("搜索软件（本地名录 {0} 条，支持中文 / 英文 / 拼音首字母）", list.Count);
+                AppendLog(string.Format("本地名录已加载: {0} 条（{1}）", list.Count, found));
+            }
+            catch (Exception ex)
+            {
+                AppendLog("本地名录加载失败: " + ex.Message);
+            }
+        }
+
+        private static string Normalize(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            var sb = new StringBuilder(s.Length);
+            foreach (char ch in s.ToLowerInvariant())
+                if (char.IsLetterOrDigit(ch)) sb.Append(ch);
+            return sb.ToString();
+        }
+
+        private static string Initials(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+
+            var sb = new StringBuilder();
+            bool inAsciiWord = false;
+
+            foreach (char ch in s)
+            {
+                if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'))
+                {
+                    if (!inAsciiWord) sb.Append(char.ToLowerInvariant(ch));
+                    inAsciiWord = true;
+                }
+                else if (ch > 127)
+                {
+                    char l;
+                    if (PyInit.TryGetValue(ch, out l)) sb.Append(l);
+                    inAsciiWord = false;
+                }
+                else inAsciiWord = false;
+            }
+            return sb.ToString();
+        }
+
+        private static int RankEntry(CatalogEntry e, string q)
+        {
+            if (e.NameNorm == q || e.Init == q || e.IdNorm == q) return 100;
+            if (e.NameNorm.StartsWith(q)) return 92;
+            if (e.Init.StartsWith(q)) return 86;
+            if (e.NameNorm.Contains(q)) return 74;
+            if (e.IdNorm.Contains(q)) return 40;
+            return 10;
+        }
+
+        private List<CatalogEntry> SearchCatalog(string query, int max)
+        {
+            var result = new List<CatalogEntry>();
+            if (_catalog.Count == 0) return result;
+
+            string q = Normalize(query);
+            if (q.Length == 0) return result;
+
+            foreach (var e in _catalog)
+            {
+                if (e.NameNorm.Length == 0) continue;
+                if (e.NameNorm.IndexOf(q, StringComparison.Ordinal) >= 0
+                    || e.Init.IndexOf(q, StringComparison.Ordinal) >= 0
+                    || e.IdNorm.IndexOf(q, StringComparison.Ordinal) >= 0)
+                {
+                    result.Add(e);
+                }
+            }
+
+            return result
+                .OrderByDescending(e => RankEntry(e, q))
+                .ThenBy(e => e.Name.Length)
+                .Take(max)
+                .ToList();
+        }
+
+        // ================= 搜索框 =================
+
+        private void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (_searchTimer == null) return;
+            _searchTimer.Stop();
+            _searchTimer.Start();
+        }
+
+        private void SearchTimer_Tick(object sender, EventArgs e)
+        {
+            _searchTimer.Stop();
+
+            string q = (SearchBox.Text ?? "").Trim();
+            if (q.Length == 0) { SearchPopup.IsOpen = false; return; }
+
+            var hits = SearchCatalog(q, 12);
+            if (hits.Count == 0) { SearchPopup.IsOpen = false; return; }
+
+            SearchList.ItemsSource = hits;
+            SearchList.SelectedIndex = -1;
+            SearchPopup.IsOpen = true;
+        }
+
+        private void SearchBox_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Down && SearchPopup.IsOpen)
+            {
+                SearchList.Focus();
+                if (SearchList.Items.Count > 0) SearchList.SelectedIndex = 0;
+                e.Handled = true;
+            }
+            else if (e.Key == Key.Enter && SearchPopup.IsOpen)
+            {
+                AddSelectedFromSearch();
+                e.Handled = true;
+            }
+            else if (e.Key == Key.Escape)
+            {
+                SearchPopup.IsOpen = false;
+            }
+        }
+
+        private void SearchList_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            AddSelectedFromSearch();
+        }
+
+        private void SearchList_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Enter) { AddSelectedFromSearch(); e.Handled = true; }
+            else if (e.Key == Key.Escape) { SearchPopup.IsOpen = false; SearchBox.Focus(); e.Handled = true; }
+        }
+
+        private void AddSelectedFromSearch()
+        {
+            var entry = SearchList.SelectedItem as CatalogEntry;
+            if (entry == null) return;
+
+            SearchPopup.IsOpen = false;
+            SearchBox.Text = "";
+
+            string cur = InputTextBox.Text ?? "";
+            if (cur.Length > 0 && !cur.EndsWith("\n")) cur += "\r\n";
+            InputTextBox.Text = cur + entry.Id + "\r\n";
+            InputTextBox.CaretIndex = InputTextBox.Text.Length;
+            InputTextBox.ScrollToEnd();
+
+            AppendLog("已加入待安装列表: " + entry.Name + " (" + entry.Id + ")");
+        }
+
+        // ================= 待安装列表补全 =================
+
+        private void InputTextBox_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (_suggestTimer == null) return;
+            _suggestTimer.Stop();
+            _suggestTimer.Start();
+        }
+
+        private void SuggestTimer_Tick(object sender, EventArgs e)
+        {
+            _suggestTimer.Stop();
+
+            string line = CurrentLineText().Trim();
+            if (line.Length < 1 || IsUrl(line)) { SuggestionPopup.IsOpen = false; return; }
+
+            var hits = SearchCatalog(line, 8);
+            if (hits.Count == 0) { SuggestionPopup.IsOpen = false; return; }
+
+            SuggestionList.ItemsSource = hits;
+            SuggestionList.SelectedIndex = -1;
+            SuggestionPopup.IsOpen = true;
+        }
+
+        private string CurrentLineText()
+        {
+            string text = InputTextBox.Text ?? "";
+            if (text.Length == 0) return "";
+
+            int caret = Math.Max(0, Math.Min(InputTextBox.CaretIndex, text.Length));
+            int start = caret - 1;
+            start = start < 0 ? 0 : text.LastIndexOf('\n', start);
+            start = start < 0 ? 0 : start + 1;
+            int end = caret >= text.Length ? text.Length : text.IndexOf('\n', caret);
+            if (end < 0) end = text.Length;
+            if (end < start) end = start;
+
+            return text.Substring(start, end - start);
+        }
+
+        private void ReplaceCurrentLine(string newText)
+        {
+            string text = InputTextBox.Text ?? "";
+            if (text.Length == 0) { InputTextBox.Text = newText; return; }
+
+            int caret = Math.Max(0, Math.Min(InputTextBox.CaretIndex, text.Length));
+            int start = caret - 1;
+            start = start < 0 ? 0 : text.LastIndexOf('\n', start);
+            start = start < 0 ? 0 : start + 1;
+            int end = caret >= text.Length ? text.Length : text.IndexOf('\n', caret);
+            if (end < 0) end = text.Length;
+            if (end < start) end = start;
+
+            InputTextBox.Text = text.Substring(0, start) + newText + text.Substring(end);
+            InputTextBox.CaretIndex = start + newText.Length;
+        }
+
+        private void SuggestionList_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            ApplySuggestion();
+        }
+
+        private void SuggestionList_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Enter) { ApplySuggestion(); e.Handled = true; }
+            else if (e.Key == Key.Escape) { SuggestionPopup.IsOpen = false; e.Handled = true; }
+        }
+
+        private void ApplySuggestion()
+        {
+            var c = SuggestionList.SelectedItem as CatalogEntry;
+            if (c == null) return;
+            SuggestionPopup.IsOpen = false;
+            ReplaceCurrentLine(c.Id);
+        }
+
+        // ================= 配置与大模型 =================
 
         private sealed class LlmConfig
         {
@@ -137,7 +443,7 @@ namespace SoftwareAssistant
 
         private static string PortableConfigPath
         {
-            get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json"); }
+            get { return Path.Combine(AppContext.BaseDirectory, "config.json"); }
         }
 
         private static string RoamingConfigPath
@@ -166,7 +472,7 @@ namespace SoftwareAssistant
                 if (cfg == null || string.IsNullOrWhiteSpace(cfg.ApiKey)) return null;
 
                 if (string.IsNullOrWhiteSpace(cfg.BaseUrl)) cfg.BaseUrl = "https://open.bigmodel.cn/api/paas/v4";
-                if (string.IsNullOrWhiteSpace(cfg.Model)) cfg.Model = "glm-5.3-flash";
+                if (string.IsNullOrWhiteSpace(cfg.Model)) cfg.Model = "glm-4.7-flashx";
                 return cfg;
             }
             catch { return null; }
@@ -252,9 +558,9 @@ namespace SoftwareAssistant
                 sb.AppendLine("候选列表：");
                 for (int i = 0; i < limit; i++)
                     sb.AppendLine(string.Format("{0}. {1} ({2})", i + 1, cands[i].Name, cands[i].Id));
-                sb.AppendLine("规则：只能从上面选。只输出一个数字——最匹配候选的序号（从 1 开始）；都不匹配输出 0。不要输出解释。");
+                sb.AppendLine("只能从上面选。只输出一个数字——最匹配候选的序号（从 1 开始）；都不匹配输出 0。不要解释。");
 
-                string ans = AskLlm(_llm, "你是软件包匹配助手，负责从候选清单中挑出用户最可能想安装的那个软件。", sb.ToString());
+                string ans = AskLlm(_llm, "你是软件包匹配助手，从候选清单中挑出用户最可能想安装的那个。", sb.ToString());
                 var m = Regex.Match(ans ?? "", @"\d+");
                 if (!m.Success) return -1;
 
@@ -269,99 +575,78 @@ namespace SoftwareAssistant
             }
         }
 
-        private List<string> AskQueries(string term)
+        private List<string> AskOfficialNames(string term)
         {
-            var result = new List<string>();
-            if (_llm == null) return result;
+            var list = new List<string>();
+            if (_llm == null) return list;
 
             try
             {
                 string ans = AskLlm(_llm,
-                    "用户要安装某个 Windows 软件，请给出 3 个最可能的英文检索关键词。每行一个，不要编号，不要解释。",
-                    "用户输入：" + term);
+                    "你要把用户口述的软件名转换成它的官方名称。每行一个候选名称（中文或英文均可），最多 5 个，从最可能到最不可能，不要编号，不要解释。",
+                    "软件：" + term);
 
                 foreach (var line in (ans ?? "").Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
                 {
                     string t = Regex.Replace(line, @"^\s*(\d+[\.\)、]|[-*])\s*", "").Trim();
-                    if (t.Length >= 2 && t.Length <= 40) result.Add(t);
-                }
-
-                if (result.Count == 0)
-                {
-                    string raw = ans ?? "";
-                    if (raw.Length > 200) raw = raw.Substring(0, 200);
-                    AppendLog("    模型返回解析不出关键词，原始内容: [" + raw + "]");
+                    if (t.Length >= 2 && t.Length <= 60) list.Add(t);
                 }
             }
             catch (Exception ex) { AppendLog("    大模型调用失败: " + ex.Message); }
 
-            return result.Distinct(StringComparer.OrdinalIgnoreCase).Take(3).ToList();
+            return list.Distinct(StringComparer.OrdinalIgnoreCase).Take(5).ToList();
         }
 
-        private static readonly string[] VendorHints =
-        {
-            "winget 包 ID 形如 发布者.产品名，例如 Alibaba.AliWorkbench、Tencent.WeChat、Google.Chrome",
-            "中国厂商常用发布者前缀：Alibaba、Tencent、ByteDance、NetEase、Baidu、Xiaomi、Huawei、Kingsoft、Sogou、Oray、Thunder、Youku、iQIYI、Bilibili",
-            "产品名通常用英文或拼音，不含空格，例如 AliWorkbench、WeChat、DingTalk、SunLogin"
-        };
-
-        private List<string> AskPackageIds(string term)
-        {
-            var result = new List<string>();
-            if (_llm == null) return result;
-
-            try
-            {
-                string ans = AskLlm(_llm,
-                    "你要把用户口述的软件名转换成 winget 包 ID。只输出候选包 ID，每行一个，最多 5 个，从最可能到最不可能，不要解释、不要编号。" +
-                    string.Join("；", VendorHints) + "。",
-                    "软件名：" + term);
-
-                foreach (var line in (ans ?? "").Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
-                {
-                    string t = Regex.Replace(line, @"^\s*(\d+[\.\)、]|[-*])\s*", "").Trim().TrimEnd('.', '。', ',', '，');
-                    if (Regex.IsMatch(t, @"^[A-Za-z0-9][A-Za-z0-9_\-\.]*\.[A-Za-z0-9_\-\.]+$"))
-                        result.Add(t);
-                }
-            }
-            catch (Exception ex) { AppendLog("    大模型调用失败: " + ex.Message); }
-
-            return result.Distinct(StringComparer.OrdinalIgnoreCase).Take(5).ToList();
-        }
-
-        private void AskOfficialSite(string term, bool isDriver, out string siteName, out string url)
+        private void AskOfficialSite(string term, bool isDriver, out string siteName, out string url, out string supportUrl)
         {
             siteName = null;
             url = null;
+            supportUrl = null;
             if (_llm == null) return;
 
             try
             {
-                string hint = isDriver
-                    ? "（这是打印机或硬件驱动，请给出厂商官方驱动下载页面；厂商可能是 HP、Canon、Epson、Brother、Ricoh、Kyocera、Lenovo、Samsung、Fuji Xerox、Pantum、奔图）"
-                    : "（请给出该软件的官方网站或官方下载页面）";
+                string sys = isDriver
+                    ? "你是硬件驱动查找助手。请给出厂商官方的『驱动下载页面』和『产品支持页面』。只输出一行：名称|驱动下载页|支持页。不要解释、不要代码块。"
+                    : "你是软件链接助手。请给出该软件的官方下载页面和支持页面。只输出一行：名称|官方下载页|支持页。不要解释。";
 
-                string ans = AskLlm(_llm,
-                    "你是软件与驱动的官方链接助手。只输出一行，格式为：名称|URL。不要输出解释、不要加代码块。",
-                    "目标：" + term + hint);
+                string user = "目标：" + term + (isDriver
+                    ? "（这是打印机或硬件驱动。必须给到具体型号的驱动页面，不要给厂商首页；厂商可能是 HP、Canon、Epson、Brother、Ricoh、Kyocera、Lenovo、Samsung、Fuji Xerox、Pantum/奔图）"
+                    : "");
 
-                string line = (ans ?? "").Trim().Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+                string ans = AskLlm(_llm, sys, user);
+                string line = (ans ?? "").Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                                         .Select(x => x.Trim())
+                                         .FirstOrDefault(x => x.Contains("|"));
                 if (string.IsNullOrEmpty(line)) return;
 
-                int bar = line.IndexOf('|');
-                if (bar <= 0) return;
-
-                string name = line.Substring(0, bar).Trim().Trim('`', '"', ' ');
-                string link = line.Substring(bar + 1).Trim().Trim('`', '"', ' ');
-
-                if (link.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
-                    link.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-                {
-                    siteName = string.IsNullOrEmpty(name) ? "官方网站" : name;
-                    url = link;
-                }
+                var parts = line.Split('|');
+                siteName = parts[0].Trim().Trim('`', '"', ' ');
+                if (parts.Length >= 2) url = CleanUrl(parts[1]);
+                if (parts.Length >= 3) supportUrl = CleanUrl(parts[2]);
             }
             catch (Exception ex) { AppendLog("    官网查询失败: " + ex.Message); }
+        }
+
+        private static string CleanUrl(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            string u = s.Trim().Trim('`', '"', '\'', ' ', '。', '，');
+
+            if (!u.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                !u.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return null;
+
+            return u;
+        }
+
+        private static bool IsHomepage(string url)
+        {
+            try
+            {
+                var u = new Uri(url);
+                return u.AbsolutePath == "/" || string.IsNullOrEmpty(u.AbsolutePath);
+            }
+            catch { return true; }
         }
 
         // ================= 包 ID 推断与学习 =================
@@ -394,6 +679,31 @@ namespace SoftwareAssistant
             }
 
             return null;
+        }
+
+        private List<string> AskPackageIds(string term)
+        {
+            var result = new List<string>();
+            if (_llm == null) return result;
+
+            try
+            {
+                string ans = AskLlm(_llm,
+                    "把用户口述的软件名转换成 winget 包 ID。只输出候选包 ID，每行一个，最多 5 个，从最可能到最不可能，不要解释。" +
+                    "包 ID 形如 发布者.产品名，例如 Alibaba.AliWorkbench、Tencent.WeChat、Google.Chrome。" +
+                    "中国厂商常用发布者：Alibaba、Tencent、ByteDance、NetEase、Baidu、Xiaomi、Huawei、Kingsoft、Sogou、Oray、Thunder、Youku、iQIYI、Bilibili。",
+                    "软件名：" + term);
+
+                foreach (var line in (ans ?? "").Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string t = Regex.Replace(line, @"^\s*(\d+[\.\)、]|[-*])\s*", "").Trim().TrimEnd('.', '。', ',', '，');
+                    if (Regex.IsMatch(t, @"^[A-Za-z0-9][A-Za-z0-9_\-\.]*\.[A-Za-z0-9_\-\.]+$"))
+                        result.Add(t);
+                }
+            }
+            catch (Exception ex) { AppendLog("    大模型调用失败: " + ex.Message); }
+
+            return result.Distinct(StringComparer.OrdinalIgnoreCase).Take(5).ToList();
         }
 
         private bool VerifyPackageId(string id, out string displayName)
@@ -436,99 +746,6 @@ namespace SoftwareAssistant
         {
             try { File.WriteAllText(AliasCachePath, JsonSerializer.Serialize(cache), Encoding.UTF8); }
             catch { }
-        }
-
-        // ================= 自动补全 =================
-
-        private void InputTextBox_TextChanged(object sender, TextChangedEventArgs e)
-        {
-            if (_suggestTimer == null) return;
-            _suggestTimer.Stop();
-            _suggestTimer.Start();
-        }
-
-        private async void SuggestTimer_Tick(object sender, EventArgs e)
-        {
-            _suggestTimer.Stop();
-
-            string line = CurrentLineText().Trim();
-            if (line.Length < 2 || IsUrl(line))
-            {
-                SuggestionPopup.IsOpen = false;
-                return;
-            }
-
-            int seq = ++_suggestSeq;
-
-            List<Candidate> found;
-            try
-            {
-                found = await Task.Run(() => SearchAll(BuildQueries(line), true)
-                                            .OrderByDescending(c => Score(line, c.Name))
-                                            .Take(6)
-                                            .ToList());
-            }
-            catch { return; }
-
-            if (seq != _suggestSeq) return;
-
-            if (found.Count == 0) { SuggestionPopup.IsOpen = false; return; }
-
-            SuggestionList.ItemsSource = found;
-            SuggestionList.SelectedIndex = -1;
-            SuggestionPopup.IsOpen = true;
-        }
-
-        private string CurrentLineText()
-        {
-            string text = InputTextBox.Text ?? "";
-            if (text.Length == 0) return "";
-
-            int caret = Math.Max(0, Math.Min(InputTextBox.CaretIndex, text.Length));
-            int start = caret - 1;
-            start = start < 0 ? 0 : text.LastIndexOf('\n', start);
-            start = start < 0 ? 0 : start + 1;
-            int end = caret >= text.Length ? text.Length : text.IndexOf('\n', caret);
-            if (end < 0) end = text.Length;
-            if (end < start) end = start;
-
-            return text.Substring(start, end - start);
-        }
-
-        private void ReplaceCurrentLine(string newText)
-        {
-            string text = InputTextBox.Text ?? "";
-            if (text.Length == 0) { InputTextBox.Text = newText; return; }
-
-            int caret = Math.Max(0, Math.Min(InputTextBox.CaretIndex, text.Length));
-            int start = caret - 1;
-            start = start < 0 ? 0 : text.LastIndexOf('\n', start);
-            start = start < 0 ? 0 : start + 1;
-            int end = caret >= text.Length ? text.Length : text.IndexOf('\n', caret);
-            if (end < 0) end = text.Length;
-            if (end < start) end = start;
-
-            InputTextBox.Text = text.Substring(0, start) + newText + text.Substring(end);
-            InputTextBox.CaretIndex = start + newText.Length;
-        }
-
-        private void SuggestionList_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
-        {
-            ApplySuggestion();
-        }
-
-        private void SuggestionList_PreviewKeyDown(object sender, KeyEventArgs e)
-        {
-            if (e.Key == Key.Enter) { ApplySuggestion(); e.Handled = true; }
-            else if (e.Key == Key.Escape) { SuggestionPopup.IsOpen = false; e.Handled = true; }
-        }
-
-        private void ApplySuggestion()
-        {
-            var c = SuggestionList.SelectedItem as Candidate;
-            if (c == null) return;
-            SuggestionPopup.IsOpen = false;
-            ReplaceCurrentLine(c.Id);
         }
 
         // ================= 已安装软件 =================
@@ -677,10 +894,7 @@ namespace SoftwareAssistant
 
         private static bool IsVCRedist(string name)
         {
-            if (name.IndexOf("Visual C++", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            if (name.IndexOf("Visual C + +", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            if (name.IndexOf("Microsoft Visual C++", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            return false;
+            return name.IndexOf("Visual C++", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static List<InstalledApp> LoadInstalledApps()
@@ -792,15 +1006,22 @@ namespace SoftwareAssistant
             if (terms.Count == 0) return;
 
             SuggestionPopup.IsOpen = false;
+            SearchPopup.IsOpen = false;
+            _stopRequested = false;
             PreviewButton.IsEnabled = false;
             StartButton.IsEnabled = false;
             LogTextBox.Text = "正在解析匹配…\r\n";
+            AppendLog(_llm == null
+                ? "提示: 未配置大模型，仅使用本地名录与包管理器"
+                : "提示: 已启用大模型辅助（" + _llm.Model + "）· 本地名录 " + _catalog.Count + " 条");
 
             Task.Run(() =>
             {
                 var plan = new List<PlanItem>();
                 for (int i = 0; i < terms.Count; i++)
                 {
+                    if (_stopRequested) { AppendLog("⏹ 已停止"); break; }
+
                     string t = terms[i];
                     SetProgress(i * 100.0 / terms.Count, "解析: " + t);
                     AppendLog("");
@@ -829,12 +1050,19 @@ namespace SoftwareAssistant
 
             bool isDriver = LooksLikeDriver(term);
 
-            AppendLog(isDriver ? "    → 按驱动处理，查询厂商官方驱动页" : "    → 包管理器都没有，查询官方网站");
+            AppendLog(isDriver ? "    → 按驱动处理，查询厂商驱动页" : "    → 包管理器都没有，查询官方网站");
 
-            string siteName, url;
-            AskOfficialSite(term, isDriver, out siteName, out url);
+            string siteName, url, supportUrl;
+            AskOfficialSite(term, isDriver, out siteName, out url, out supportUrl);
 
-            var item = new PlanItem { Term = term, Kind = PlanKind.Link, SiteName = siteName, Url = url };
+            var item = new PlanItem
+            {
+                Term = term,
+                Kind = PlanKind.Link,
+                SiteName = siteName,
+                Url = url,
+                SupportUrl = supportUrl
+            };
 
             if (isDriver)
             {
@@ -842,15 +1070,15 @@ namespace SoftwareAssistant
                 item.AlternateUrl = "https://www.catalog.update.microsoft.com/Search.aspx?q=" + Uri.EscapeDataString(term);
             }
 
-            if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(item.AlternateUrl))
+            if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(supportUrl) && string.IsNullOrEmpty(item.AlternateUrl))
             {
                 item.Kind = PlanKind.None;
                 AppendLog("    ❌ 未能找到任何可用来源");
             }
             else
             {
-                if (!string.IsNullOrEmpty(url)) AppendLog("    → 官网: " + url);
-                if (!string.IsNullOrEmpty(item.AlternateUrl)) AppendLog("    → 备用: " + item.AlternateName);
+                if (!string.IsNullOrEmpty(url)) AppendLog("    → 下载页: " + url + (IsHomepage(url) ? "  ⚠ 这是首页" : ""));
+                if (!string.IsNullOrEmpty(supportUrl)) AppendLog("    → 支持页: " + supportUrl);
             }
 
             return item;
@@ -867,8 +1095,8 @@ namespace SoftwareAssistant
             var win = new Window
             {
                 Title = "确认安装清单",
-                Width = 820,
-                Height = 560,
+                Width = 860,
+                Height = 580,
                 Owner = this,
                 WindowStartupLocation = WindowStartupLocation.CenterOwner,
                 Background = MakeBrush("#1B1C20")
@@ -910,7 +1138,7 @@ namespace SoftwareAssistant
             foreach (var p in plan)
             {
                 var row = new Grid { Margin = new Thickness(0, 7, 0, 7) };
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(180) });
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(190) });
                 row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
                 var left = new TextBlock
@@ -955,7 +1183,27 @@ namespace SoftwareAssistant
                 else
                 {
                     if (!string.IsNullOrEmpty(p.Url))
-                        right.Children.Add(MakeLink(p.SiteName + "  " + p.Url, p.Url));
+                    {
+                        var dl = MakeLink("驱动/下载页  " + p.Url, p.Url);
+                        right.Children.Add(dl);
+                        if (IsHomepage(p.Url))
+                        {
+                            right.Children.Add(new TextBlock
+                            {
+                                Text = "⚠ 这是厂商首页，需要自己再找型号",
+                                Foreground = MakeBrush("#E0A030"),
+                                FontSize = 11,
+                                Margin = new Thickness(0, 2, 0, 0)
+                            });
+                        }
+                    }
+
+                    if (!string.IsNullOrEmpty(p.SupportUrl))
+                    {
+                        var sp = MakeLink("产品支持页  " + p.SupportUrl, p.SupportUrl);
+                        sp.Margin = new Thickness(0, 4, 0, 0);
+                        right.Children.Add(sp);
+                    }
 
                     if (!string.IsNullOrEmpty(p.AlternateUrl))
                     {
@@ -970,12 +1218,7 @@ namespace SoftwareAssistant
                 panel.Children.Add(new Border { Height = 1, Background = MakeBrush("#2F3238") });
             }
 
-            var scroll = new ScrollViewer
-            {
-                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                Content = panel
-            };
-            root.Children.Add(scroll);
+            root.Children.Add(new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Content = panel });
 
             win.Content = root;
             win.ShowDialog();
@@ -1001,7 +1244,7 @@ namespace SoftwareAssistant
 
         private static Button MakeDialogButton(string text, string bg, string fg, double width)
         {
-            var b = new Button
+            return new Button
             {
                 Content = text,
                 Width = width,
@@ -1010,7 +1253,6 @@ namespace SoftwareAssistant
                 Foreground = MakeBrush(fg),
                 BorderThickness = new Thickness(0)
             };
-            return b;
         }
 
         private static readonly Dictionary<string, Brush> _brushCache = new Dictionary<string, Brush>();
@@ -1049,11 +1291,12 @@ namespace SoftwareAssistant
                     else if (p.Kind == PlanKind.Package) done = InstallCandidate(p.Pick);
                     else if (p.Kind == PlanKind.Link)
                     {
-                        string target = !string.IsNullOrEmpty(p.Url) ? p.Url : p.AlternateUrl;
+                        string target = !string.IsNullOrEmpty(p.SupportUrl) ? p.SupportUrl
+                                      : (!string.IsNullOrEmpty(p.Url) ? p.Url : p.AlternateUrl);
                         try
                         {
                             Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
-                            AppendLog("    → 已在浏览器中打开官方页面，请手动下载安装");
+                            AppendLog("    → 已在浏览器打开: " + target + "，请手动下载安装");
                             done = true;
                         }
                         catch (Exception ex) { AppendLog("    ❌ 打开链接失败: " + ex.Message); }
@@ -1087,12 +1330,13 @@ namespace SoftwareAssistant
             if (list.Count == 0) return;
 
             SuggestionPopup.IsOpen = false;
+            SearchPopup.IsOpen = false;
             _stopRequested = false;
             StartButton.IsEnabled = false;
             PreviewButton.IsEnabled = false;
             LogTextBox.Text = "开始执行...\r\n";
             AppendLog(_llm == null
-                ? "提示: 未配置大模型，使用本地模糊匹配。配置路径: " + ActiveConfigPath
+                ? "提示: 未配置大模型，使用本地目录与包管理器。配置路径: " + ActiveConfigPath
                 : "提示: 已启用大模型辅助（" + _llm.Model + "）");
             SetProgress(0, "准备中");
 
@@ -1123,8 +1367,8 @@ namespace SoftwareAssistant
         {
             if (IsUrl(term)) return InstallFromUrl(term);
 
-            AppendLog("  [1/3] winget（winget + msstore）");
-            if (TryWinget(term)) return true;
+            var pick = ResolveTerm(term);
+            if (pick != null && InstallCandidate(pick)) return true;
 
             AppendLog("  [2/3] Chocolatey");
             if (TryChoco(term)) return true;
@@ -1133,14 +1377,16 @@ namespace SoftwareAssistant
             if (TryScoop(term)) return true;
 
             bool isDriver = LooksLikeDriver(term);
-            string siteName, url;
-            AskOfficialSite(term, isDriver, out siteName, out url);
-            if (!string.IsNullOrEmpty(url))
+            string siteName, url, supportUrl;
+            AskOfficialSite(term, isDriver, out siteName, out url, out supportUrl);
+
+            string target = !string.IsNullOrEmpty(supportUrl) ? supportUrl : url;
+            if (!string.IsNullOrEmpty(target))
             {
                 try
                 {
-                    Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
-                    AppendLog("  → 已打开官方页面: " + url);
+                    Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+                    AppendLog("  → 已打开官方页面: " + target);
                     return true;
                 }
                 catch (Exception ex) { AppendLog("  打开链接失败: " + ex.Message); }
@@ -1154,27 +1400,46 @@ namespace SoftwareAssistant
 
         private Candidate ResolveTerm(string term)
         {
+            // 1) 本地名录（毫秒级）
+            var local = SearchCatalog(term, 5);
+            if (local.Count > 0)
+            {
+                var best = local[0];
+                int rank = RankEntry(best, Normalize(term));
+                if (rank >= 86)
+                {
+                    AppendLog("    ✅ 本地名录命中: " + best.Name + " (" + best.Id + ")");
+                    return new Candidate { Name = best.Name, Id = best.Id, Source = "本地名录" };
+                }
+                AppendLog("    → 本地名录有相近项，继续联网搜索");
+            }
+
+            // 2) 直接给的是包 ID
             if (LooksLikeId(term) && VerifyPackageId(term, out string idName))
             {
-                AppendLog("    ✅ 精确命中: " + idName + " (" + term + ")");
+                AppendLog("    ✅ 包 ID 精确命中: " + idName);
                 return new Candidate { Name = idName, Id = term, Source = "ID" };
             }
 
+            // 3) winget 搜索
             var queries = BuildQueries(term);
-            var all = SearchAll(queries, false);
-
-            if (all.Count == 0 && _llm != null)
-            {
-                var extra = AskQueries(term);
-                if (extra.Count > 0)
-                {
-                    AppendLog("    winget 无结果，大模型建议检索词: " + string.Join(" / ", extra));
-                    all = SearchAll(extra, false);
-                }
-            }
+            var all = SearchAll(queries);
 
             if (all.Count == 0)
             {
+                // 4) 让 AI 说官方名称，再查本地名录
+                var names = AskOfficialNames(term);
+                foreach (var n in names)
+                {
+                    var hit = SearchCatalog(n, 1);
+                    if (hit.Count > 0 && RankEntry(hit[0], Normalize(n)) >= 86)
+                    {
+                        AppendLog("    ✅ AI 名称命中名录: " + n + " -> " + hit[0].Id);
+                        return new Candidate { Name = hit[0].Name, Id = hit[0].Id, Source = "AI 名称" };
+                    }
+                }
+
+                // 5) 让 AI 猜包 ID，并校验
                 AppendLog("    winget 搜索无结果，尝试推断包 ID");
                 var inferred = ResolvePackageId(term);
                 if (inferred != null) return inferred;
@@ -1220,7 +1485,7 @@ namespace SoftwareAssistant
             SetIndeterminate("安装 " + pick.Id);
             if (RunProcess("winget", "install --id \"" + pick.Id + "\" --exact --silent --accept-package-agreements --accept-source-agreements", out string installOut))
             {
-                AppendLog("    ✅ 成功");
+                AppendLog("    ✅ 安装成功: " + pick.Id);
                 return true;
             }
 
@@ -1229,30 +1494,19 @@ namespace SoftwareAssistant
             return false;
         }
 
-        private bool TryWinget(string term)
-        {
-            var pick = ResolveTerm(term);
-            if (pick == null) return false;
-            return InstallCandidate(pick);
-        }
-
-        private List<Candidate> SearchAll(List<string> queries, bool quiet)
+        private List<Candidate> SearchAll(List<string> queries)
         {
             var all = new List<Candidate>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var q in queries)
             {
-                if (!quiet)
-                {
-                    AppendLog("    → 搜索关键词: " + q);
-                    SetIndeterminate("搜索: " + q);
-                }
-
+                AppendLog("    → 搜索关键词: " + q);
+                SetIndeterminate("搜索: " + q);
                 RunProcess("winget", "search \"" + q + "\" --accept-source-agreements", out string so);
 
                 foreach (var c in ParseWinget(so))
-                    if (seen.Add(c.Id + "|" + c.Name)) all.Add(c);
+                    if (seen.Add(c.Id)) all.Add(c);
             }
             return all;
         }
@@ -1328,15 +1582,6 @@ namespace SoftwareAssistant
             return list;
         }
 
-        private static string Normalize(string s)
-        {
-            if (string.IsNullOrEmpty(s)) return "";
-            var sb = new StringBuilder(s.Length);
-            foreach (char ch in s.ToLowerInvariant())
-                if (char.IsLetterOrDigit(ch)) sb.Append(ch);
-            return sb.ToString();
-        }
-
         private static double Score(string term, string candidate)
         {
             string a = Normalize(term);
@@ -1396,7 +1641,7 @@ namespace SoftwareAssistant
         {
             if (!HasCommand("choco"))
             {
-                AppendLog("    未检测到 Chocolatey，跳过（https://chocolatey.org/install）");
+                AppendLog("    未检测到 Chocolatey，跳过");
                 return false;
             }
 
@@ -1448,7 +1693,7 @@ namespace SoftwareAssistant
         {
             if (!HasCommand("scoop"))
             {
-                AppendLog("    未检测到 Scoop，跳过（https://scoop.sh）");
+                AppendLog("    未检测到 Scoop，跳过");
                 return false;
             }
 
@@ -1662,8 +1907,6 @@ namespace SoftwareAssistant
             var principal = new WindowsPrincipal(identity);
             return principal.IsInRole(WindowsBuiltInRole.Administrator);
         }
-
-        private volatile bool _stopRequested;
 
         private void StopButton_Click(object sender, RoutedEventArgs e)
         {
