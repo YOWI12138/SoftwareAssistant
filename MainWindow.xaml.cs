@@ -1120,6 +1120,26 @@ namespace SoftwareAssistant
 
         // ================= 检查匹配 =================
 
+        private ItemResult StartWebSearch(string term, string status)
+        {
+            var item = new ItemResult { Term = term, Status = status };
+            lock (_results) _results.Add(item);
+            Dispatcher.Invoke(delegate { RebuildWebPanel(); });
+
+            var local = item;
+            Task.Run(() => SearchWeb(term)).ContinueWith(t =>
+            {
+                local.Hits = SafeWait(t);
+                Dispatcher.Invoke(delegate
+                {
+                    if (local.Status == "检索中") local.Status = "已检索";
+                    RebuildWebPanel();
+                });
+            });
+
+            return item;
+        }
+
         private void PreviewButton_Click(object sender, RoutedEventArgs e)
         {
             if (!IsAdministrator()) return;
@@ -1146,7 +1166,22 @@ namespace SoftwareAssistant
                     SetProgress(i * 100.0 / terms.Count, "解析: " + t);
                     AppendLog("");
                     AppendLog(string.Format("解析 ({0}/{1}): {2}", i + 1, terms.Count, t));
-                    plan.Add(ResolvePlanItem(t));
+
+                    var item = StartWebSearch(t, "检索中");
+                    var p = ResolvePlanItem(t);
+                    plan.Add(p);
+
+                    if (p.Kind == PlanKind.Package && p.Pick != null)
+                    {
+                        item.PackageId = p.Pick.Id;
+                        item.PackageName = p.Pick.Name;
+                    }
+                    else if (p.Kind == PlanKind.None)
+                    {
+                        item.Status = "无来源";
+                    }
+
+                    Dispatcher.Invoke(delegate { RebuildWebPanel(); });
                 }
 
                 Dispatcher.Invoke(delegate
@@ -1352,11 +1387,7 @@ namespace SoftwareAssistant
                     _itemIndex = i;
                     _itemStart = DateTime.Now;
 
-                    var item = new ItemResult { Term = p.Term, Status = "执行中" };
-                    lock (_results) _results.Add(item);
-                    Dispatcher.Invoke(delegate { RebuildWebPanel(); });
-
-                    var webTask = Task.Run(() => SearchWeb(p.Term));
+                    var item = StartWebSearch(p.Term, "执行中");
 
                     bool done = false;
                     if (p.Kind == PlanKind.Url) done = InstallFromUrl(p.Term);
@@ -1373,7 +1404,6 @@ namespace SoftwareAssistant
                         catch (Exception ex) { AppendLog("    ❌ 打开失败: " + ex.Message); }
                     }
 
-                    item.Hits = SafeWait(webTask);
                     item.Status = done ? "成功" : "失败";
                     item.Ok = done;
 
@@ -1443,18 +1473,13 @@ namespace SoftwareAssistant
                     _itemIndex = i;
                     _itemStart = DateTime.Now;
 
-                    var item = new ItemResult { Term = term, Status = "安装中" };
-                    lock (_results) _results.Add(item);
-                    Dispatcher.Invoke(delegate { RebuildWebPanel(); });
-
-                    var webTask = Task.Run(() => SearchWeb(term));
+                    var item = StartWebSearch(term, "安装中");
 
                     AppendLog("\r\n========================================");
                     AppendLog(string.Format("[{0}/{1}] {2}", i + 1, list.Count, term));
 
                     bool done = InstallOne(term, item);
 
-                    item.Hits = SafeWait(webTask);
                     item.Status = done ? "成功" : "失败";
                     item.Ok = done;
 
@@ -1860,7 +1885,7 @@ namespace SoftwareAssistant
             {
                 WebPanel.Children.Add(new TextBlock
                 {
-                    Text = "安装时会并行检索官网与下载页，结果显示在这里。",
+                    Text = "检查匹配与安装时都会并行检索官网，结果显示在这里。",
                     Foreground = MakeBrush("#6B7280"),
                     FontSize = 11,
                     TextWrapping = TextWrapping.Wrap
